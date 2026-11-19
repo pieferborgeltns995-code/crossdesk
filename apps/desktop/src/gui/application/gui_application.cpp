@@ -1278,6 +1278,7 @@ int GuiApplication::Run() {
   // The native tray icon is managed outside Slint, so Slint cannot count it
   // when deciding whether the last hidden window should stop the event loop.
   // Keep the loop alive until the tray's explicit Exit action requests quit.
+#ifdef _WIN32
   if (config_center_->IsStartMinimizedToTray()) {
     if (MinimizeMainWindowToTray()) {
       ui_->main->hide();
@@ -1287,6 +1288,9 @@ int GuiApplication::Run() {
   } else {
     ui_->main->show();
   }
+#else
+  ui_->main->show();
+#endif
 #if _WIN32
   if (ui_->main->window().win32_hwnd()) {
     ConfigureWindowsWindowIcons(ui_->main->window().win32_hwnd());

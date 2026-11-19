@@ -237,12 +237,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
-            binary_arch: x86_64
-            runner: macos-26-intel
-            cache-key: intel-macos26-xcode26.6-min14
-            out-dir: ./build/macosx/x86_64/release/crossdesk
-            package_script: ./apps/desktop/scripts/macos/pkg_x64.sh
           - arch: arm64
             binary_arch: arm64
             runner: macos-26
@@ -417,6 +411,7 @@ jobs:
 
   # Windows
   build-windows-x64:
+    if: false
     name: Build on Windows x64
     needs: prepare-version
     runs-on: windows-2022

@@ -123,8 +123,13 @@ class ConfigCenter {
   std::atomic<bool> trusted_devices_only_{false};
   std::atomic<bool> save_remote_previews_{true};
   std::atomic<bool> pause_video_when_minimized_{true};
+#ifdef _WIN32
   std::atomic<bool> show_controlled_bar_{false};
   std::atomic<bool> start_minimized_to_tray_{true};
+#else
+  std::atomic<bool> show_controlled_bar_{true};
+  std::atomic<bool> start_minimized_to_tray_{false};
+#endif
   bool portable_service_prompt_suppressed_ = false;
   std::string sponsorship_prompt_dismissed_version_;
   std::string file_transfer_save_path_ = "";

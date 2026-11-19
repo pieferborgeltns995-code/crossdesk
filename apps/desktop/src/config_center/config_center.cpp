@@ -165,10 +165,17 @@ int ConfigCenter::Load() {
       ini_->GetBoolValue(section_, "save_remote_previews", true));
   pause_video_when_minimized_.store(
       ini_->GetBoolValue(section_, "pause_video_when_minimized", true));
+#ifdef _WIN32
   show_controlled_bar_.store(
       ini_->GetBoolValue(section_, "show_controlled_bar", false));
   start_minimized_to_tray_.store(
       ini_->GetBoolValue(section_, "start_minimized_to_tray", true));
+#else
+  show_controlled_bar_.store(
+      ini_->GetBoolValue(section_, "show_controlled_bar", true));
+  start_minimized_to_tray_.store(
+      ini_->GetBoolValue(section_, "start_minimized_to_tray", false));
+#endif
   portable_service_prompt_suppressed_ =
       ini_->GetBoolValue(section_, "portable_service_prompt_suppressed",
                         portable_service_prompt_suppressed_);
