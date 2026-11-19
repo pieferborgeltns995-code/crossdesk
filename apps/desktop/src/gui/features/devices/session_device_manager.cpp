@@ -82,10 +82,8 @@ bool SessionDeviceManager::ShouldSendCapturedFrame(
   if (now + kFrameDeadlineTolerance < next_frame_deadline_) {
     return false;
   }
-  next_frame_deadline_ += interval;
-  if (next_frame_deadline_ <= now) {
-    next_frame_deadline_ = now + interval;
-  }
+  next_frame_deadline_ =
+      (std::max)(next_frame_deadline_ + interval, now + interval / 2);
   return true;
 }
 

@@ -1162,8 +1162,8 @@ void ScreenCapturerDxgi::CaptureLoop() {
   const auto frame_interval =
       std::chrono::nanoseconds(1'000'000'000) / (std::max)(1, fps_);
   auto next_frame_deadline = std::chrono::steady_clock::now();
-  bool synced_to_vsync = false;
   bool cached_frame_valid = false;
+  bool cached_frame_fresh = false;
   bool cached_cursor_embedded = false;
   int cached_monitor = -1;
   uint64_t cached_generation = 0;
@@ -1191,12 +1191,18 @@ void ScreenCapturerDxgi::CaptureLoop() {
   } cached_gpu_frame;
   auto clear_cached = [&] {
     cached_frame_valid = false;
+    cached_frame_fresh = false;
     cached_gpu_frame.Reset();
   };
+  auto advance_frame_deadline =
+      [&](std::chrono::steady_clock::time_point ref_now) {
+        next_frame_deadline =
+            (std::max)(next_frame_deadline + frame_interval,
+                       ref_now + frame_interval / 2);
+      };
   while (running_) {
     if (paused_) {
       clear_cached();
-      synced_to_vsync = false;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
@@ -1217,10 +1223,18 @@ void ScreenCapturerDxgi::CaptureLoop() {
       next_topology_check = now + std::chrono::milliseconds(500);
       const bool changed = EnumerateDisplays();
       if (changed || refresh || !duplication_) {
-        clear_cached();
-        synced_to_vsync = false;
+        const int target_monitor = monitor_index_.load();
+        const ID3D11Device* prev_device = d3d_device_.Get();
+        if (changed || refresh || cached_monitor != target_monitor) {
+          clear_cached();
+        }
         ReleaseDuplication();
-        CreateDuplicationForMonitor(monitor_index_.load());
+        if (!CreateDuplicationForMonitor(target_monitor) ||
+            d3d_device_.Get() != prev_device) {
+          clear_cached();
+        } else if (cached_frame_valid) {
+          cached_generation = duplication_generation_;
+        }
         capture_lock.unlock();
         if ((changed || refresh) && callback_)
           callback_(nullptr, ScreenCapturer::kDisplayTopologyChanged,
@@ -1230,7 +1244,6 @@ void ScreenCapturerDxgi::CaptureLoop() {
     }
     if (!duplication_) {
       clear_cached();
-      synced_to_vsync = false;
       capture_lock.unlock();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
@@ -1241,10 +1254,14 @@ void ScreenCapturerDxgi::CaptureLoop() {
       if (!cached_frame_valid || cached_generation != duplication_generation_ ||
           cached_monitor != monitor_index_.load() || !callback_)
         return;
+      const bool need_cursor_recompose =
+          !cached_frame_fresh &&
+          (show_cursor_.load(std::memory_order_relaxed) ||
+           cached_cursor_embedded);
+      cached_frame_fresh = false;
       if (cached_gpu_frame.frame) {
-        if ((show_cursor_.load(std::memory_order_relaxed) ||
-             cached_cursor_embedded) &&
-            gpu_converter_ && gpu_converter_->HasCleanBgra()) {
+        if (need_cursor_recompose && gpu_converter_ &&
+            gpu_converter_->HasCleanBgra()) {
           GpuNv12Frame* rebuilt = nullptr;
           if (gpu_converter_->ConvertFromClean(
                   cached_monitor, display_info_list_,
@@ -1274,7 +1291,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
       if (!nv12_frame_) return;
       // Recompose from the clean staging texture while showing a cursor, or
       // once after disabling it. Never replay a baked-in stale cursor.
-      if ((show_cursor_.load(std::memory_order_relaxed) || cached_cursor_embedded) &&
+      if (need_cursor_recompose &&
           !ConvertFrame(cached_monitor, &cached_cursor_embedded, cursor_compositor)) {
         clear_cached();
         return;
@@ -1286,15 +1303,11 @@ void ScreenCapturerDxgi::CaptureLoop() {
                 nv12_height_, stream_id.c_str(), nullptr);
     };
     const auto before_acquire = std::chrono::steady_clock::now();
-    const auto wait_deadline =
-        synced_to_vsync
-            ? (next_frame_deadline + std::chrono::milliseconds(3))
-            : next_frame_deadline;
     int wait_ms = 1;
-    if (wait_deadline > before_acquire) {
+    if (next_frame_deadline > before_acquire) {
       wait_ms = static_cast<int>(
           std::chrono::duration_cast<std::chrono::milliseconds>(
-              wait_deadline - before_acquire)
+              next_frame_deadline - before_acquire)
               .count());
       if (wait_ms < 1) wait_ms = 1;
     }
@@ -1305,20 +1318,17 @@ void ScreenCapturerDxgi::CaptureLoop() {
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
       // DXGI explicitly reports an unchanged desktop. Re-emit only a frame
       // successfully acquired for this monitor to keep delivering static frames.
-      synced_to_vsync = false;
       const auto timeout_now = std::chrono::steady_clock::now();
-      next_frame_deadline += frame_interval;
-      if (next_frame_deadline <= timeout_now) {
-        next_frame_deadline = timeout_now + frame_interval;
+      if (timeout_now + std::chrono::milliseconds(2) < next_frame_deadline) {
+        continue;
       }
+      advance_frame_deadline(timeout_now);
       deliver_cached();
       continue;
     }
-    // Never replay a cached image after an acquisition/conversion failure or
+    // Never replay a cached image after repeated acquisition failures or
     // a backend rebuild. Display recovery retains the session privacy state.
     if (FAILED(hr)) {
-      clear_cached();
-      synced_to_vsync = false;
       LOG_ERROR("DXGI: AcquireNextFrame failed, hr={}", (int)hr);
       ReleaseDuplication();
       // A single ACCESS_LOST (mode switch, fullscreen toggle, UAC return) is
@@ -1327,6 +1337,8 @@ void ScreenCapturerDxgi::CaptureLoop() {
       // recreating D3D devices.
       if (++acquire_failures == 1) {
         next_topology_check = std::chrono::steady_clock::now();
+      } else {
+        clear_cached();
       }
       continue;
     }
@@ -1346,24 +1358,18 @@ void ScreenCapturerDxgi::CaptureLoop() {
     // its surface. Keep the last confirmed desktop until a present arrives.
     if (frame_info.LastPresentTime.QuadPart == 0) {
       if (FAILED(ReleaseAcquiredFrame())) {
-        clear_cached();
-        synced_to_vsync = false;
         ReleaseDuplication();
         next_topology_check = std::chrono::steady_clock::now();
       } else {
         const auto after_pointer = std::chrono::steady_clock::now();
-        if (after_pointer + std::chrono::milliseconds(1) >= wait_deadline) {
-          synced_to_vsync = false;
-          next_frame_deadline += frame_interval;
-          if (next_frame_deadline <= after_pointer) {
-            next_frame_deadline = after_pointer + frame_interval;
-          }
+        if (after_pointer + std::chrono::milliseconds(2) >=
+            next_frame_deadline) {
+          advance_frame_deadline(after_pointer);
           deliver_cached();
         }
       }
       continue;
     }
-    clear_cached();
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> acquired_tex;
     if (desktop_resource) {
@@ -1423,8 +1429,6 @@ void ScreenCapturerDxgi::CaptureLoop() {
           ConvertFrame(frame_monitor, &cursor_embedded, cursor_compositor);
     }
 
-    const std::string stream_id = MakeDisplayStreamId(frame_monitor);
-    cached_generation = duplication_generation_;
     if (converted && frame_monitor == monitor_index_.load() && callback_) {
       if (last_logged_cursor_embedding_ < 0 ||
           (software_cursor_output_ &&
@@ -1451,26 +1455,36 @@ void ScreenCapturerDxgi::CaptureLoop() {
       next_topology_check = std::chrono::steady_clock::now();
       continue;
     }
-    capture_lock.unlock();
 
     if (converted && frame_monitor == monitor_index_.load() && callback_) {
-      synced_to_vsync = true;
-      next_frame_deadline = std::chrono::steady_clock::now() + frame_interval;
-      CapturedCursorFrameScope cursor_scope(cursor_embedded);
+      const bool first_valid_frame = !cached_frame_valid;
       if (gpu_frame) {
-        callback_(nullptr, static_cast<int>(gpu_frame->LogicalSize()),
-                  static_cast<int>(gpu_w), static_cast<int>(gpu_h),
-                  stream_id.c_str(), gpu_frame->Descriptor());
         cached_gpu_frame.Set(gpu_frame, gpu_w, gpu_h);
       } else {
-        callback_(nv12_frame_, nv12_width_ * nv12_height_ * 3 / 2, nv12_width_,
-                  nv12_height_, stream_id.c_str(), nullptr);
+        cached_gpu_frame.Reset();
       }
       cached_cursor_embedded = cursor_embedded;
       cached_monitor = frame_monitor;
+      cached_generation = duplication_generation_;
       cached_frame_valid = true;
-    } else if (gpu_frame) {
-      gpu_frame->Release();
+      cached_frame_fresh = true;
+
+      const auto after_convert = std::chrono::steady_clock::now();
+      if (first_valid_frame) {
+        next_frame_deadline = after_convert + frame_interval;
+        deliver_cached();
+      } else if (after_convert + std::chrono::milliseconds(2) >=
+                 next_frame_deadline) {
+        advance_frame_deadline(after_convert);
+        deliver_cached();
+      }
+    } else {
+      if (gpu_frame) {
+        gpu_frame->Release();
+      }
+      if (!converted) {
+        clear_cached();
+      }
     }
   }
 }
