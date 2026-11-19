@@ -11051,6 +11051,30 @@
       "fr": "Résolution de l’écran distant",
       "es": "Resolución de la pantalla remota",
       "pt-BR": "Resolução da tela remota"
+    },
+    "显示“被控中”悬浮条": {
+      "zh-Hans": "显示“被控中”悬浮条",
+      "en": "Show controlled status bar",
+      "ru": "Показывать панель статуса управления",
+      "zh-Hant": "顯示「被控中」懸浮條",
+      "ja": "「制御中」フローティングバーを表示",
+      "ko": "제어됨 상태 표시줄 표시",
+      "de": "Statusleiste bei Steuerung anzeigen",
+      "fr": "Afficher la barre d’état contrôlé",
+      "es": "Mostrar barra de estado controlado",
+      "pt-BR": "Mostrar barra de status controlado"
+    },
+    "启动时最小化到托盘": {
+      "zh-Hans": "启动时最小化到托盘",
+      "en": "Start minimized to tray",
+      "ru": "Запускать свернутым в трей",
+      "zh-Hant": "啟動時最小化到系統列",
+      "ja": "起動時にトレイへ最小化",
+      "ko": "시작 시 트레이로 최소화",
+      "de": "Minimiert im Infobereich starten",
+      "fr": "Démarrer réduit dans la zone de notification",
+      "es": "Iniciar minimizado en la bandeja",
+      "pt-BR": "Iniciar minimizado na bandeja"
     }
   },
   "desktop": {
@@ -11348,7 +11372,9 @@
     "windows_service_repairing": "正在修复 Windows 服务…",
     "windows_service_repair_success": "服务已修复并启动",
     "windows_service_repair_failed": "修复失败，请检查管理员权限和便携版文件后重试",
-    "remote_service_unavailable_message": "远端 Windows 服务不可用，锁屏时无法操作。请在远端安装或修复 CrossDesk 服务。"
+    "remote_service_unavailable_message": "远端 Windows 服务不可用，锁屏时无法操作。请在远端安装或修复 CrossDesk 服务。",
+    "show_controlled_bar": "显示“被控中”悬浮条",
+    "start_minimized_to_tray": "启动时最小化到托盘"
   },
   "slint": [
     "此端口已被占用，",
@@ -12104,7 +12130,9 @@
       "正在导出…",
       "没有找到可导出的日志。",
       "诊断日志已导出，请将 ZIP 附到 GitHub Issue。",
-      "请在 GitHub Issue 中附上导出的 ZIP 日志包，便于排查问题。"
+      "请在 GitHub Issue 中附上导出的 ZIP 日志包，便于排查问题。",
+      "显示“被控中”悬浮条",
+      "启动时最小化到托盘"
     ],
     "android": [
       " · 已完成",

@@ -1274,9 +1274,19 @@ int GuiApplication::Run() {
   // The native tray icon is managed outside Slint, so Slint cannot count it
   // when deciding whether the last hidden window should stop the event loop.
   // Keep the loop alive until the tray's explicit Exit action requests quit.
-  ui_->main->show();
+  if (config_center_->IsStartMinimizedToTray()) {
+    if (MinimizeMainWindowToTray()) {
+      ui_->main->hide();
+    } else {
+      ui_->main->show();
+    }
+  } else {
+    ui_->main->show();
+  }
 #if _WIN32
-  ConfigureWindowsWindowIcons(ui_->main->window().win32_hwnd());
+  if (ui_->main->window().win32_hwnd()) {
+    ConfigureWindowsWindowIcons(ui_->main->window().win32_hwnd());
+  }
 #elif defined(__APPLE__)
   ConfigureMainWindowChrome(ui_->main->window().appkit_view());
   PrepareNativeFileDialog();
@@ -1621,6 +1631,8 @@ void GuiApplication::ResetSettingsUi(bool gallery_window) {
   main->set_daemon_enabled(enable_daemon_);
   main->set_save_remote_previews(config_center_->IsSaveRemotePreviews());
   main->set_pause_video_when_minimized(config_center_->IsPauseVideoWhenMinimized());
+  main->set_show_controlled_bar(config_center_->IsShowControlledBar());
+  main->set_start_minimized_to_tray(config_center_->IsStartMinimizedToTray());
   main->set_privacy_on_connect_enabled(
       config_center_->IsEnablePrivacyScreen());
   main->set_privacy_local_unlock_allowed(config_center_->IsPrivacyLocalUnlockAllowed());
@@ -4622,7 +4634,8 @@ void GuiApplication::SyncServerWindow() {
   // Privacy protects local display output while preserving capture.
   // Keep the panel alive throughout privacy transitions so remote
   // controllers can still see and operate it without resetting its UI state.
-  bool show_controller_window = has_connected_controller;
+  bool show_controller_window =
+      has_connected_controller && config_center_->IsShowControlledBar();
 #if !defined(_WIN32) && !defined(__APPLE__) && !(defined(__linux__) && !defined(__OHOS__))
   // Preserve the existing panel behavior on other platforms.
   const auto privacy_status = privacy_.Snapshot();
@@ -4717,6 +4730,10 @@ void GuiApplication::SyncServerWindow() {
     if (!ConfigureWindowsServerWindow(window)) return;
 #endif
     window.show();
+#if _WIN32
+    // Re-apply WS_EX_TOOLWINDOW after show() so Windows/winit does not add a taskbar button.
+    ConfigureWindowsServerWindow(window);
+#endif
   };
   show_prepared((*ui_->server_bar)->window());
   if (!server_window_collapsed_) show_prepared((*ui_->server)->window());
@@ -5082,6 +5099,15 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
         localization::Literal("保存失败，请重试", localization_language_index_)));
     return false;
   }
+  if (config_center_->SetShowControlledBar(main->get_show_controlled_bar()) != 0 ||
+      config_center_->SetStartMinimizedToTray(main->get_start_minimized_to_tray()) != 0) {
+    if (wall_changed && !ui_->gallery.Save(ui_->gallery_path))
+      LOG_ERROR("Failed to restore DeskHub settings after taskbar preference save failure");
+    main->set_settings_save_error(UiText(
+        localization::Literal("保存失败，请重试", localization_language_index_)));
+    return false;
+  }
+  SyncServerWindow();
   try {
     const bool listen_all = main->get_lan_listen_all_draft();
     if (LanAvailable() && main->get_ip_direct_enabled_draft()) {

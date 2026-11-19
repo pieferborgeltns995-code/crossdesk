@@ -81,6 +81,8 @@ export global UiStrings {
     in-out property <string> self-hosted: "Self-hosted server";
     in-out property <string> autostart: "Start with system";
     in-out property <string> daemon: "Run in background";
+    in-out property <string> show-controlled-bar: "Show controlled status bar";
+    in-out property <string> start-minimized-to-tray: "Start minimized to tray";
     in-out property <string> save-remote-previews: "Save remote screen previews";
     in-out property <string> unknown-platform: "Unknown platform";
     in-out property <string> privacy-local-unlock: "Allow privacy screen unlock while controlled";
@@ -759,6 +761,8 @@ export component MainWindow inherits Window {
     in-out property <bool> daemon-enabled: false;
     in-out property <bool> save-remote-previews: true;
     in-out property <bool> pause-video-when-minimized: true;
+    in-out property <bool> show-controlled-bar: false;
+    in-out property <bool> start-minimized-to-tray: true;
     // Show the preference on every platform; only adapted hosts can change it.
     in property <bool> privacy-setting-available: false;
     in-out property <bool> privacy-on-connect-enabled: true;
@@ -3044,7 +3048,7 @@ export component MainWindow inherits Window {
                             }
                         }
                         SettingsGroup {
-                            title: GalleryStrings.texts[123]; rows: 2;
+                            title: GalleryStrings.texts[123]; rows: 4;
                             if !root.autostart-system-managed: SettingsToggleRow { label: UiStrings.autostart; checked <=> root.autostart-enabled; enabled: root.autostart-available && !root.settings-session-active; }
                             if root.autostart-system-managed: SettingsToggleRow {
                                 label: UiStrings.autostart;
@@ -3052,7 +3056,9 @@ export component MainWindow inherits Window {
                                 toggle-on-click: false;
                                 clicked => { root.autostart-guide-open = true; }
                             }
-                            SettingsToggleRow { label: UiStrings.daemon; checked <=> root.daemon-enabled; enabled: !root.settings-session-active; divider: false; }
+                            SettingsToggleRow { label: UiStrings.daemon; checked <=> root.daemon-enabled; enabled: !root.settings-session-active; }
+                            SettingsToggleRow { label: UiStrings.show-controlled-bar; checked <=> root.show-controlled-bar; }
+                            SettingsToggleRow { label: UiStrings.start-minimized-to-tray; checked <=> root.start-minimized-to-tray; divider: false; }
                         }
                         if root.service-autostart-platform: Text {
                             text: root.service-autostart-hint; wrap: word-wrap;

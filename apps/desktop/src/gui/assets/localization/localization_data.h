@@ -554,6 +554,8 @@ inline constexpr TranslationRow kTranslationRows[] = {
   {"没有找到可导出的日志。", {"没有找到可导出的日志。", "No logs were found to export.", "Журналы для экспорта не найдены.", "找不到可匯出的日誌。", "エクスポートできるログが見つかりません。", "내보낼 로그를 찾을 수 없습니다.", "Keine Protokolle zum Exportieren gefunden.", "Aucun journal à exporter trouvé.", "No se encontraron registros para exportar.", "Nenhum log encontrado para exportar."}},
   {"诊断日志已导出，请将 ZIP 附到 GitHub Issue。", {"诊断日志已导出，请将 ZIP 附到 GitHub Issue。", "Diagnostic logs exported. Attach the ZIP to your GitHub issue.", "Журналы диагностики экспортированы. Прикрепите ZIP-файл к обращению на GitHub.", "診斷日誌已匯出，請將 ZIP 附到 GitHub Issue。", "診断ログをエクスポートしました。ZIP を GitHub Issue に添付してください。", "진단 로그를 내보냈습니다. GitHub 이슈에 ZIP을 첨부하세요.", "Diagnoseprotokolle exportiert. Hängen Sie die ZIP-Datei an Ihr GitHub-Issue an.", "Journaux de diagnostic exportés. Joignez le ZIP à votre ticket GitHub.", "Registros de diagnóstico exportados. Adjunta el ZIP a tu issue de GitHub.", "Logs de diagnóstico exportados. Anexe o ZIP à sua issue do GitHub."}},
   {"请在 GitHub Issue 中附上导出的 ZIP 日志包，便于排查问题。", {"请在 GitHub Issue 中附上导出的 ZIP 日志包，便于排查问题。", "Attach the exported ZIP log archive to your GitHub issue to help us investigate.", "Прикрепите экспортированный ZIP-архив журналов к обращению на GitHub, чтобы помочь нам разобраться в проблеме.", "請在 GitHub Issue 中附上匯出的 ZIP 日誌封存檔，便於排查問題。", "問題の調査のため、エクスポートしたログの ZIP ファイルを GitHub Issue に添付してください。", "문제 조사에 도움이 되도록 내보낸 ZIP 로그 파일을 GitHub 이슈에 첨부해 주세요.", "Hängen Sie das exportierte ZIP-Archiv mit den Protokollen an Ihr GitHub-Issue an, damit wir das Problem untersuchen können.", "Joignez l’archive ZIP des journaux exportés à votre ticket GitHub pour nous aider à analyser le problème.", "Adjunta el archivo ZIP de los registros exportados a tu issue de GitHub para ayudarnos a investigar el problema.", "Anexe o arquivo ZIP dos logs exportados à sua issue do GitHub para nos ajudar a investigar o problema."}},
+  {"显示“被控中”悬浮条", {"显示“被控中”悬浮条", "Show controlled status bar", "Показывать панель статуса управления", "顯示「被控中」懸浮條", "「制御中」フローティングバーを表示", "제어됨 상태 표시줄 표시", "Statusleiste bei Steuerung anzeigen", "Afficher la barre d’état contrôlé", "Mostrar barra de estado controlado", "Mostrar barra de status controlado"}},
+  {"启动时最小化到托盘", {"启动时最小化到托盘", "Start minimized to tray", "Запускать свернутым в трей", "啟動時最小化到系統列", "起動時にトレイへ最小化", "시작 시 트레이로 최소화", "Minimiert im Infobereich starten", "Démarrer réduit dans la zone de notification", "Iniciar minimizado en la bandeja", "Iniciar minimizado na bandeja"}},
 };
 
 struct NamedTranslation { const char* name; const char* literal; };
@@ -853,6 +855,8 @@ inline constexpr NamedTranslation kNamedTranslations[] = {
   {"windows_service_repair_success", "服务已修复并启动"},
   {"windows_service_repair_failed", "修复失败，请检查管理员权限和便携版文件后重试"},
   {"remote_service_unavailable_message", "远端 Windows 服务不可用，锁屏时无法操作。请在远端安装或修复 CrossDesk 服务。"},
+  {"show_controlled_bar", "显示“被控中”悬浮条"},
+  {"start_minimized_to_tray", "启动时最小化到托盘"},
 };
 inline constexpr const char* kSlintLiterals[] = {
   "此端口已被占用，",
@@ -1363,7 +1367,9 @@ inline constexpr const char* kSlintLiterals[] = {
   X(windows_service_repairing) \
   X(windows_service_repair_success) \
   X(windows_service_repair_failed) \
-  X(remote_service_unavailable_message)
+  X(remote_service_unavailable_message) \
+  X(show_controlled_bar) \
+  X(start_minimized_to_tray)
 
 }  // namespace localization
 }  // namespace crossdesk

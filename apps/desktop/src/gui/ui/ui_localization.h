@@ -150,6 +150,9 @@ inline int ApplyMainWindowStrings(
       Text(localization::self_hosted_server_config[language]));
   strings.set_autostart(Text(localization::enable_autostart[language]));
   strings.set_daemon(Text(localization::enable_daemon[language]));
+  strings.set_show_controlled_bar(Text(localization::show_controlled_bar[language]));
+  strings.set_start_minimized_to_tray(
+      Text(localization::start_minimized_to_tray[language]));
   strings.set_save_remote_previews(Text(localization::save_remote_previews[language]));
   strings.set_unknown_platform(Text(localization::unknown_platform[language]));
   strings.set_privacy_local_unlock(Text(localization::privacy_local_unlock[language]));

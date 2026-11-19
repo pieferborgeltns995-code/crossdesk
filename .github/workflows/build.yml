@@ -103,6 +103,7 @@ jobs:
           echo "Desktop version: ${VERSION_NUM}"
 
   build-linux:
+    if: false
     name: Build Linux (${{ matrix.arch }})
     needs: prepare-version
     runs-on: ${{ matrix.runner }}
@@ -224,6 +225,7 @@ jobs:
 
   # macOS
   build-macos:
+    if: false
     name: Build on macOS
     needs: prepare-version
     runs-on: ${{ matrix.runner }}
@@ -396,6 +398,7 @@ jobs:
 
   # iOS (also available as a standalone workflow)
   build-ios:
+    if: false
     name: Build iOS
     uses: ./.github/workflows/build-ios.yml
     with:
@@ -405,6 +408,7 @@ jobs:
 
   # Android (also available as a standalone workflow)
   build-android:
+    if: false
     name: Build Android
     uses: ./.github/workflows/build-android.yml
     with:

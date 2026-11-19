@@ -165,6 +165,10 @@ int ConfigCenter::Load() {
       ini_->GetBoolValue(section_, "save_remote_previews", true));
   pause_video_when_minimized_.store(
       ini_->GetBoolValue(section_, "pause_video_when_minimized", true));
+  show_controlled_bar_.store(
+      ini_->GetBoolValue(section_, "show_controlled_bar", false));
+  start_minimized_to_tray_.store(
+      ini_->GetBoolValue(section_, "start_minimized_to_tray", true));
   portable_service_prompt_suppressed_ =
       ini_->GetBoolValue(section_, "portable_service_prompt_suppressed",
                         portable_service_prompt_suppressed_);
@@ -268,6 +272,10 @@ int ConfigCenter::Save() {
                     save_remote_previews_.load());
   ini_->SetBoolValue(section_, "pause_video_when_minimized",
                     pause_video_when_minimized_.load());
+  ini_->SetBoolValue(section_, "show_controlled_bar",
+                    show_controlled_bar_.load());
+  ini_->SetBoolValue(section_, "start_minimized_to_tray",
+                    start_minimized_to_tray_.load());
   ini_->SetBoolValue(section_, "portable_service_prompt_suppressed",
                     portable_service_prompt_suppressed_);
   ini_->SetValue(section_, "sponsorship_prompt_dismissed_version",
@@ -572,6 +580,30 @@ int ConfigCenter::SetPauseVideoWhenMinimized(bool enabled) {
 
 bool ConfigCenter::IsPauseVideoWhenMinimized() const {
   return pause_video_when_minimized_.load();
+}
+
+int ConfigCenter::SetShowControlledBar(bool enabled) {
+  if (StoreValues({{"show_controlled_bar", enabled ? "true" : "false"}}) != 0) {
+    return -1;
+  }
+  show_controlled_bar_.store(enabled);
+  return 0;
+}
+
+bool ConfigCenter::IsShowControlledBar() const {
+  return show_controlled_bar_.load();
+}
+
+int ConfigCenter::SetStartMinimizedToTray(bool enabled) {
+  if (StoreValues({{"start_minimized_to_tray", enabled ? "true" : "false"}}) != 0) {
+    return -1;
+  }
+  start_minimized_to_tray_.store(enabled);
+  return 0;
+}
+
+bool ConfigCenter::IsStartMinimizedToTray() const {
+  return start_minimized_to_tray_.load();
 }
 
 int ConfigCenter::SetPortableServicePromptSuppressed(bool suppressed) {
