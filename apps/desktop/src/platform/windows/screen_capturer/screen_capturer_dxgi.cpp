@@ -3,11 +3,17 @@
 #include <display_stream_id.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "captured_cursor_state.h"
+#include "cursor_draw.h"
 #include "cursor_frame_compositor.h"
 #include "display_label.h"
 #include "dxgi_cursor_state.h"
@@ -27,7 +33,685 @@ std::wstring GetOutputDeviceId(const std::wstring& device_name) {
   }
   return device.DeviceID;
 }
+
+uint32_t AlignUpDim(uint32_t value, uint32_t align) {
+  return ((value + align - 1U) / align) * align;
+}
+
+void ComputeAlignedNv12TextureSize(uint32_t even_w, uint32_t even_h,
+                                     uint32_t* tex_w, uint32_t* tex_h) {
+  if (even_w == 1920U && even_h == 1080U) {
+    *tex_w = 1920U;
+    *tex_h = 1080U;
+    return;
+  }
+  *tex_w = AlignUpDim(even_w, 64U);
+  *tex_h = AlignUpDim(even_h, 16U);
+}
+
+bool ComputeCursorPatchRect(const CURSORINFO& cursor, int disp_left,
+                            int disp_top, int max_w, int max_h, int* out_x0,
+                            int* out_y0, int* out_x1, int* out_y1) {
+  if (!(cursor.flags & CURSOR_SHOWING) || !cursor.hCursor) return false;
+  struct IconGuard : ICONINFO {
+    IconGuard() : ICONINFO{} {}
+    ~IconGuard() {
+      if (hbmColor) DeleteObject(hbmColor);
+      if (hbmMask) DeleteObject(hbmMask);
+    }
+  } icon;
+  if (!GetIconInfo(cursor.hCursor, &icon)) return false;
+  BITMAP bm{};
+  if (!GetObject(icon.hbmColor ? icon.hbmColor : icon.hbmMask, sizeof(bm), &bm)) {
+    return false;
+  }
+  const int cw = bm.bmWidth;
+  const int ch = icon.hbmColor ? bm.bmHeight : bm.bmHeight / 2;
+  if (cw <= 0 || ch <= 0) return false;
+  const int64_t x0 =
+      static_cast<int64_t>(cursor.ptScreenPos.x) - disp_left - icon.xHotspot;
+  const int64_t y0 =
+      static_cast<int64_t>(cursor.ptScreenPos.y) - disp_top - icon.yHotspot;
+  const int64_t x1 = x0 + cw;
+  const int64_t y1 = y0 + ch;
+  if (x0 >= max_w || y0 >= max_h || x1 <= 0 || y1 <= 0) return false;
+  *out_x0 = static_cast<int>((std::max<int64_t>)(0, x0));
+  *out_y0 = static_cast<int>((std::max<int64_t>)(0, y0));
+  *out_x1 = static_cast<int>((std::min<int64_t>)(max_w, x1));
+  *out_y1 = static_cast<int>((std::min<int64_t>)(max_h, y1));
+  return *out_x1 > *out_x0 && *out_y1 > *out_y0;
+}
 }  // namespace
+
+class GpuNv12Pool final : public std::enable_shared_from_this<GpuNv12Pool> {
+ public:
+  static constexpr size_t kMaxFrames = 6;
+
+  GpuNv12Pool(Microsoft::WRL::ComPtr<ID3D11Device> device,
+              Microsoft::WRL::ComPtr<ID3D11DeviceContext> context)
+      : device_(std::move(device)), context_(std::move(context)) {
+    if (device_) {
+      device_.As(&multithread_);
+    }
+  }
+
+  ~GpuNv12Pool() {
+    Retire();
+  }
+
+  ID3D11Device* Device() const { return device_.Get(); }
+  ID3D11DeviceContext* Context() const { return context_.Get(); }
+
+  GpuNv12Frame* Acquire(ID3D11VideoDevice* vdev,
+                        ID3D11VideoProcessorEnumerator* vp_enum,
+                        uint32_t vis_w, uint32_t vis_h, uint32_t tex_w,
+                        uint32_t tex_h);
+  void RecycleOrDestroy(GpuNv12Frame* frame);
+  void Retire();
+  int CopyTextureToNv12(ID3D11Texture2D* tex, uint32_t vis_w, uint32_t vis_h,
+                        uint32_t tex_w, uint32_t tex_h, uint8_t* destination,
+                        size_t destination_size);
+
+ private:
+  Microsoft::WRL::ComPtr<ID3D11Device> device_;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
+  Microsoft::WRL::ComPtr<ID3D10Multithread> multithread_;
+  std::mutex mutex_;
+  std::atomic<bool> retired_{false};
+  std::vector<GpuNv12Frame*> free_frames_;
+  size_t total_allocated_ = 0;
+
+  std::mutex copy_mutex_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_nv12_;
+  uint32_t staging_w_ = 0;
+  uint32_t staging_h_ = 0;
+};
+
+class GpuNv12Frame final {
+ public:
+  GpuNv12Frame(std::shared_ptr<GpuNv12Pool> pool,
+               Microsoft::WRL::ComPtr<ID3D11Texture2D> tex,
+               Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> view,
+               uint32_t vis_w, uint32_t vis_h, uint32_t tex_w, uint32_t tex_h)
+      : pool_(std::move(pool)),
+        texture_(std::move(tex)),
+        out_view_(std::move(view)),
+        vis_w_(vis_w),
+        vis_h_(vis_h),
+        tex_w_(tex_w),
+        tex_h_(tex_h) {
+    descriptor_.struct_size = sizeof(descriptor_);
+    descriptor_.type = MiniRtcNativeVideoFrameD3d11Nv12;
+    descriptor_.width = vis_w_;
+    descriptor_.height = vis_h_;
+    descriptor_.payload.d3d11_nv12.d3d11_device = pool_->Device();
+    descriptor_.payload.d3d11_nv12.texture = texture_.Get();
+    descriptor_.payload.d3d11_nv12.subresource_index = 0;
+    descriptor_.payload.d3d11_nv12.texture_width = tex_w_;
+    descriptor_.payload.d3d11_nv12.texture_height = tex_h_;
+    descriptor_.owner = this;
+    descriptor_.retain = &RetainOwner;
+    descriptor_.release = &ReleaseOwner;
+    descriptor_.copy_to_nv12 = &CopyToNv12;
+  }
+
+  const MiniRtcNativeVideoFrame* Descriptor() const { return &descriptor_; }
+  ID3D11VideoProcessorOutputView* OutputView() const { return out_view_.Get(); }
+  size_t LogicalSize() const {
+    return static_cast<size_t>(vis_w_) * vis_h_ * 3U / 2U;
+  }
+
+  void ResetRef() { references_.store(1, std::memory_order_relaxed); }
+
+  void AddRef() { references_.fetch_add(1, std::memory_order_relaxed); }
+
+  void Release() {
+    if (references_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      if (pool_) {
+        pool_->RecycleOrDestroy(this);
+      } else {
+        delete this;
+      }
+    }
+  }
+
+ private:
+  static void RetainOwner(void* owner) {
+    if (owner) static_cast<GpuNv12Frame*>(owner)->AddRef();
+  }
+
+  static void ReleaseOwner(void* owner) {
+    if (owner) static_cast<GpuNv12Frame*>(owner)->Release();
+  }
+
+  static int CopyToNv12(void* owner, uint8_t* destination,
+                        size_t destination_size) {
+    if (!owner) return -1;
+    auto* self = static_cast<GpuNv12Frame*>(owner);
+    return self->pool_
+               ? self->pool_->CopyTextureToNv12(
+                     self->texture_.Get(), self->vis_w_, self->vis_h_,
+                     self->tex_w_, self->tex_h_, destination, destination_size)
+               : -1;
+  }
+
+  std::atomic<uint32_t> references_{1};
+  std::shared_ptr<GpuNv12Pool> pool_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> out_view_;
+  uint32_t vis_w_ = 0;
+  uint32_t vis_h_ = 0;
+  uint32_t tex_w_ = 0;
+  uint32_t tex_h_ = 0;
+  MiniRtcNativeVideoFrame descriptor_{};
+};
+
+GpuNv12Frame* GpuNv12Pool::Acquire(ID3D11VideoDevice* vdev,
+                                   ID3D11VideoProcessorEnumerator* vp_enum,
+                                   uint32_t vis_w, uint32_t vis_h,
+                                   uint32_t tex_w, uint32_t tex_h) {
+  if (!vdev || !vp_enum || retired_.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!free_frames_.empty()) {
+      GpuNv12Frame* frame = free_frames_.back();
+      free_frames_.pop_back();
+      frame->ResetRef();
+      return frame;
+    }
+    if (total_allocated_ >= kMaxFrames) {
+      return nullptr;
+    }
+    ++total_allocated_;
+  }
+
+  D3D11_TEXTURE2D_DESC desc{};
+  desc.Width = tex_w;
+  desc.Height = tex_h;
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_NV12;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+  HRESULT hr = device_->CreateTexture2D(&desc, nullptr, tex.GetAddressOf());
+  if (FAILED(hr) || !tex) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    --total_allocated_;
+    return nullptr;
+  }
+
+  D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC vdesc{};
+  vdesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+  vdesc.Texture2D.MipSlice = 0;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> view;
+  hr = vdev->CreateVideoProcessorOutputView(tex.Get(), vp_enum, &vdesc,
+                                            view.GetAddressOf());
+  if (FAILED(hr) || !view) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    --total_allocated_;
+    return nullptr;
+  }
+
+  return new GpuNv12Frame(shared_from_this(), std::move(tex), std::move(view),
+                          vis_w, vis_h, tex_w, tex_h);
+}
+
+void GpuNv12Pool::RecycleOrDestroy(GpuNv12Frame* frame) {
+  if (!frame) return;
+  if (retired_.load(std::memory_order_acquire)) {
+    delete frame;
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (retired_.load(std::memory_order_acquire)) {
+    delete frame;
+    return;
+  }
+  free_frames_.push_back(frame);
+}
+
+void GpuNv12Pool::Retire() {
+  retired_.store(true, std::memory_order_release);
+  std::vector<GpuNv12Frame*> to_delete;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    to_delete.swap(free_frames_);
+  }
+  for (GpuNv12Frame* frame : to_delete) {
+    delete frame;
+  }
+}
+
+int GpuNv12Pool::CopyTextureToNv12(ID3D11Texture2D* tex, uint32_t vis_w,
+                                   uint32_t vis_h, uint32_t tex_w,
+                                   uint32_t tex_h, uint8_t* destination,
+                                   size_t destination_size) {
+  const size_t required = static_cast<size_t>(vis_w) * vis_h * 3U / 2U;
+  if (!tex || !destination || destination_size < required || !device_ ||
+      !context_) {
+    return -1;
+  }
+  std::lock_guard<std::mutex> lock(copy_mutex_);
+  if (multithread_) multithread_->Enter();
+  struct MultithreadGuard {
+    ID3D10Multithread* mt;
+    ~MultithreadGuard() {
+      if (mt) mt->Leave();
+    }
+  } mt_guard{multithread_.Get()};
+
+  if (!staging_nv12_ || staging_w_ != tex_w || staging_h_ != tex_h) {
+    staging_nv12_.Reset();
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = tex_w;
+    desc.Height = tex_h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device_->CreateTexture2D(&desc, nullptr,
+                                        staging_nv12_.GetAddressOf())) ||
+        !staging_nv12_) {
+      return -1;
+    }
+    staging_w_ = tex_w;
+    staging_h_ = tex_h;
+  }
+
+  context_->CopyResource(staging_nv12_.Get(), tex);
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  if (FAILED(context_->Map(staging_nv12_.Get(), 0, D3D11_MAP_READ, 0,
+                           &mapped))) {
+    return -1;
+  }
+  const auto* src = static_cast<const uint8_t*>(mapped.pData);
+  const size_t pitch = static_cast<size_t>(mapped.RowPitch);
+  int result = 0;
+  if (!src || pitch < vis_w) {
+    result = -1;
+  } else {
+    for (uint32_t y = 0; y < vis_h; ++y) {
+      std::memcpy(destination + static_cast<size_t>(y) * vis_w,
+                  src + static_cast<size_t>(y) * pitch, vis_w);
+    }
+    const uint8_t* src_uv = src + static_cast<size_t>(tex_h) * pitch;
+    uint8_t* dst_uv = destination + static_cast<size_t>(vis_w) * vis_h;
+    for (uint32_t y = 0; y < vis_h / 2U; ++y) {
+      std::memcpy(dst_uv + static_cast<size_t>(y) * vis_w,
+                  src_uv + static_cast<size_t>(y) * pitch, vis_w);
+    }
+  }
+  context_->Unmap(staging_nv12_.Get(), 0);
+  return result;
+}
+
+class DxgiGpuNv12Converter final {
+ public:
+  static constexpr int kMaxCursorPatch = 256;
+
+  DxgiGpuNv12Converter(Microsoft::WRL::ComPtr<ID3D11Device> device,
+                       Microsoft::WRL::ComPtr<ID3D11DeviceContext> context)
+      : device_(std::move(device)), context_(std::move(context)) {}
+
+  ~DxgiGpuNv12Converter() {
+    ResetCursorDib();
+    if (pool_) pool_->Retire();
+  }
+
+  bool HasCleanBgra() const { return clean_bgra_ != nullptr; }
+
+  bool CaptureAndConvert(ID3D11Texture2D* acquired_tex, int frame_monitor,
+                         const std::vector<DisplayInfo>& displays,
+                         bool show_cursor, bool* cursor_embedded,
+                         GpuNv12Frame** out_frame, uint32_t* out_w,
+                         uint32_t* out_h) {
+    if (!acquired_tex || !out_frame || !out_w || !out_h) return false;
+    D3D11_TEXTURE2D_DESC src_desc{};
+    acquired_tex->GetDesc(&src_desc);
+    const uint32_t even_w = src_desc.Width & ~1U;
+    const uint32_t even_h = src_desc.Height & ~1U;
+    if (even_w == 0 || even_h == 0) return false;
+    if (!EnsurePipeline(src_desc.Width, src_desc.Height, even_w, even_h)) {
+      return false;
+    }
+    context_->CopyResource(clean_bgra_.Get(), acquired_tex);
+    *out_w = even_w;
+    *out_h = even_h;
+    return ConvertFromClean(frame_monitor, displays, show_cursor,
+                            cursor_embedded, out_frame);
+  }
+
+  bool ConvertFromClean(int frame_monitor,
+                        const std::vector<DisplayInfo>& displays,
+                        bool show_cursor, bool* cursor_embedded,
+                        GpuNv12Frame** out_frame) {
+    if (!clean_bgra_ || !vp_ || !video_context_ || !pool_ || !out_frame) {
+      return false;
+    }
+    *cursor_embedded = false;
+
+    ID3D11VideoProcessorInputView* input_view = clean_input_view_.Get();
+    if (frame_monitor >= 0 &&
+        frame_monitor < static_cast<int>(displays.size())) {
+      const auto& display = displays[frame_monitor];
+      CURSORINFO cursor{};
+      cursor.cbSize = sizeof(cursor);
+      if (GetCursorInfo(&cursor)) {
+        const bool visible = (cursor.flags & CURSOR_SHOWING) != 0;
+        const bool should_draw = SharedDxgiCursorState().ShouldDrawCursor(
+            visible, display.handle);
+        *cursor_embedded = visible && !should_draw &&
+            MonitorFromPoint(cursor.ptScreenPos, MONITOR_DEFAULTTONULL) ==
+                display.handle;
+        if (show_cursor && should_draw) {
+          int cx0 = 0, cy0 = 0, cx1 = 0, cy1 = 0;
+          if (ComputeCursorPatchRect(cursor, display.left, display.top,
+                                     static_cast<int>(vis_w_),
+                                     static_cast<int>(vis_h_), &cx0, &cy0,
+                                     &cx1, &cy1)) {
+            if (cx1 - cx0 > kMaxCursorPatch || cy1 - cy0 > kMaxCursorPatch) {
+              return false;
+            }
+            if (!CompositeCursorPatch(cursor, display.left, display.top, cx0,
+                                      cy0, cx1, cy1)) {
+              return false;
+            }
+            input_view = composited_input_view_.Get();
+            *cursor_embedded = true;
+          }
+        }
+      }
+    }
+
+    GpuNv12Frame* frame = pool_->Acquire(video_device_.Get(), vp_enum_.Get(),
+                                         vis_w_, vis_h_, tex_w_, tex_h_);
+    if (!frame) return false;
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = input_view;
+    const HRESULT hr = video_context_->VideoProcessorBlt(
+        vp_.Get(), frame->OutputView(), frame_index_++, 1, &stream);
+    if (FAILED(hr)) {
+      frame->Release();
+      return false;
+    }
+    context_->Flush();
+    *out_frame = frame;
+    return true;
+  }
+
+ private:
+  bool EnsurePipeline(uint32_t src_w, uint32_t src_h, uint32_t even_w,
+                      uint32_t even_h) {
+    uint32_t target_tex_w = 0, target_tex_h = 0;
+    ComputeAlignedNv12TextureSize(even_w, even_h, &target_tex_w, &target_tex_h);
+    if (clean_bgra_ && src_w_ == src_w && src_h_ == src_h && vis_w_ == even_w &&
+        vis_h_ == even_h && tex_w_ == target_tex_w &&
+        tex_h_ == target_tex_h && vp_ && pool_) {
+      return true;
+    }
+    ResetPipeline();
+    if (!device_ || !context_) return false;
+    if (FAILED(device_.As(&video_device_)) || !video_device_ ||
+        FAILED(context_.As(&video_context_)) || !video_context_) {
+      return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC cdesc{};
+    cdesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    cdesc.InputFrameRate.Numerator = 60;
+    cdesc.InputFrameRate.Denominator = 1;
+    cdesc.InputWidth = even_w;
+    cdesc.InputHeight = even_h;
+    cdesc.OutputFrameRate.Numerator = 60;
+    cdesc.OutputFrameRate.Denominator = 1;
+    cdesc.OutputWidth = target_tex_w;
+    cdesc.OutputHeight = target_tex_h;
+    cdesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+    if (FAILED(video_device_->CreateVideoProcessorEnumerator(
+            &cdesc, vp_enum_.GetAddressOf())) ||
+        !vp_enum_) {
+      ResetPipeline();
+      return false;
+    }
+    if (FAILED(video_device_->CreateVideoProcessor(vp_enum_.Get(), 0,
+                                                   vp_.GetAddressOf())) ||
+        !vp_) {
+      ResetPipeline();
+      return false;
+    }
+
+    D3D11_TEXTURE2D_DESC bgra_desc{};
+    bgra_desc.Width = src_w;
+    bgra_desc.Height = src_h;
+    bgra_desc.MipLevels = 1;
+    bgra_desc.ArraySize = 1;
+    bgra_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bgra_desc.SampleDesc.Count = 1;
+    bgra_desc.Usage = D3D11_USAGE_DEFAULT;
+    bgra_desc.BindFlags = 0;
+    if (FAILED(device_->CreateTexture2D(&bgra_desc, nullptr,
+                                        clean_bgra_.GetAddressOf())) ||
+        !clean_bgra_) {
+      ResetPipeline();
+      return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv_desc{};
+    iv_desc.FourCC = 0;
+    iv_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    iv_desc.Texture2D.MipSlice = 0;
+    iv_desc.Texture2D.ArraySlice = 0;
+    if (FAILED(video_device_->CreateVideoProcessorInputView(
+            clean_bgra_.Get(), vp_enum_.Get(), &iv_desc,
+            clean_input_view_.GetAddressOf())) ||
+        !clean_input_view_) {
+      ResetPipeline();
+      return false;
+    }
+
+    RECT src_rect{0, 0, static_cast<LONG>(even_w), static_cast<LONG>(even_h)};
+    RECT target_rect{0, 0, static_cast<LONG>(target_tex_w),
+                     static_cast<LONG>(target_tex_h)};
+    video_context_->VideoProcessorSetStreamFrameFormat(
+        vp_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    video_context_->VideoProcessorSetStreamAutoProcessingMode(vp_.Get(), 0,
+                                                              FALSE);
+    video_context_->VideoProcessorSetStreamSourceRect(vp_.Get(), 0, TRUE,
+                                                      &src_rect);
+    video_context_->VideoProcessorSetStreamDestRect(vp_.Get(), 0, TRUE,
+                                                    &src_rect);
+    video_context_->VideoProcessorSetOutputTargetRect(vp_.Get(), TRUE,
+                                                      &target_rect);
+
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE in_cs{};
+    in_cs.Usage = 0;
+    in_cs.RGB_Range = 0;
+    in_cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+    video_context_->VideoProcessorSetStreamColorSpace(vp_.Get(), 0, &in_cs);
+
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE out_cs{};
+    out_cs.Usage = 0;
+    out_cs.YCbCr_Matrix = 0;
+    out_cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    video_context_->VideoProcessorSetOutputColorSpace(vp_.Get(), &out_cs);
+
+    D3D11_VIDEO_COLOR bg{};
+    bg.YCbCr = {0.0625f, 0.5f, 0.5f, 1.0f};
+    video_context_->VideoProcessorSetOutputBackgroundColor(vp_.Get(), TRUE,
+                                                           &bg);
+
+    src_w_ = src_w;
+    src_h_ = src_h;
+    vis_w_ = even_w;
+    vis_h_ = even_h;
+    tex_w_ = target_tex_w;
+    tex_h_ = target_tex_h;
+    frame_index_ = 0;
+    pool_ = std::make_shared<GpuNv12Pool>(device_, context_);
+    return true;
+  }
+
+  bool CompositeCursorPatch(const CURSORINFO& cursor, int disp_left,
+                            int disp_top, int cx0, int cy0, int cx1, int cy1) {
+    if (!EnsureCursorResources()) return false;
+    context_->CopyResource(composited_bgra_.Get(), clean_bgra_.Get());
+    D3D11_BOX src_box{static_cast<UINT>(cx0), static_cast<UINT>(cy0), 0,
+                      static_cast<UINT>(cx1), static_cast<UINT>(cy1), 1};
+    context_->CopySubresourceRegion(cursor_staging_.Get(), 0, 0, 0, 0,
+                                    clean_bgra_.Get(), 0, &src_box);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_->Map(cursor_staging_.Get(), 0, D3D11_MAP_READ, 0,
+                             &mapped))) {
+      return false;
+    }
+    const int box_w = cx1 - cx0;
+    const int box_h = cy1 - cy0;
+    const size_t row_bytes = static_cast<size_t>(box_w) * 4U;
+    const size_t dib_stride = static_cast<size_t>(kMaxCursorPatch) * 4U;
+    const auto* src_bytes = static_cast<const uint8_t*>(mapped.pData);
+    auto* dst_bytes = static_cast<uint8_t*>(cursor_bits_);
+    for (int y = 0; y < box_h; ++y) {
+      std::memcpy(dst_bytes + static_cast<size_t>(y) * dib_stride,
+                  src_bytes + static_cast<size_t>(y) * mapped.RowPitch,
+                  row_bytes);
+    }
+    context_->Unmap(cursor_staging_.Get(), 0);
+    if (!DrawCursorInCapture(cursor_dc_, cursor, disp_left + cx0,
+                             disp_top + cy0, box_w, box_h)) {
+      return false;
+    }
+    GdiFlush();
+    context_->UpdateSubresource(composited_bgra_.Get(), 0, &src_box,
+                                cursor_bits_,
+                                static_cast<UINT>(dib_stride), 0);
+    return true;
+  }
+
+  bool EnsureCursorResources() {
+    if (composited_bgra_ && composited_input_view_ && cursor_staging_ &&
+        cursor_bits_) {
+      return true;
+    }
+    if (!composited_bgra_) {
+      D3D11_TEXTURE2D_DESC desc{};
+      clean_bgra_->GetDesc(&desc);
+      if (FAILED(device_->CreateTexture2D(&desc, nullptr,
+                                          composited_bgra_.GetAddressOf())) ||
+          !composited_bgra_) {
+        return false;
+      }
+      D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv_desc{};
+      iv_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+      if (FAILED(video_device_->CreateVideoProcessorInputView(
+              composited_bgra_.Get(), vp_enum_.Get(), &iv_desc,
+              composited_input_view_.GetAddressOf())) ||
+          !composited_input_view_) {
+        composited_bgra_.Reset();
+        return false;
+      }
+    }
+    if (!cursor_staging_) {
+      D3D11_TEXTURE2D_DESC sdesc{};
+      sdesc.Width = kMaxCursorPatch;
+      sdesc.Height = kMaxCursorPatch;
+      sdesc.MipLevels = 1;
+      sdesc.ArraySize = 1;
+      sdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      sdesc.SampleDesc.Count = 1;
+      sdesc.Usage = D3D11_USAGE_STAGING;
+      sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (FAILED(device_->CreateTexture2D(&sdesc, nullptr,
+                                          cursor_staging_.GetAddressOf())) ||
+          !cursor_staging_) {
+        return false;
+      }
+    }
+    if (!cursor_bits_) {
+      cursor_dc_ = CreateCompatibleDC(nullptr);
+      if (!cursor_dc_) return false;
+      BITMAPINFO info{};
+      info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+      info.bmiHeader.biWidth = kMaxCursorPatch;
+      info.bmiHeader.biHeight = -kMaxCursorPatch;
+      info.bmiHeader.biPlanes = 1;
+      info.bmiHeader.biBitCount = 32;
+      info.bmiHeader.biCompression = BI_RGB;
+      cursor_bmp_ = CreateDIBSection(cursor_dc_, &info, DIB_RGB_COLORS,
+                                     &cursor_bits_, nullptr, 0);
+      if (!cursor_bmp_ || !cursor_bits_) {
+        ResetCursorDib();
+        return false;
+      }
+      cursor_prev_bmp_ = SelectObject(cursor_dc_, cursor_bmp_);
+      if (!cursor_prev_bmp_ || cursor_prev_bmp_ == HGDI_ERROR) {
+        cursor_prev_bmp_ = nullptr;
+        ResetCursorDib();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void ResetCursorDib() {
+    if (cursor_dc_ && cursor_prev_bmp_) SelectObject(cursor_dc_, cursor_prev_bmp_);
+    if (cursor_bmp_) DeleteObject(cursor_bmp_);
+    if (cursor_dc_) DeleteDC(cursor_dc_);
+    cursor_dc_ = nullptr;
+    cursor_bmp_ = nullptr;
+    cursor_prev_bmp_ = nullptr;
+    cursor_bits_ = nullptr;
+  }
+
+  void ResetPipeline() {
+    if (pool_) {
+      pool_->Retire();
+      pool_.reset();
+    }
+    composited_input_view_.Reset();
+    composited_bgra_.Reset();
+    clean_input_view_.Reset();
+    clean_bgra_.Reset();
+    cursor_staging_.Reset();
+    vp_.Reset();
+    vp_enum_.Reset();
+    video_context_.Reset();
+    video_device_.Reset();
+    src_w_ = src_h_ = vis_w_ = vis_h_ = tex_w_ = tex_h_ = 0;
+  }
+
+  Microsoft::WRL::ComPtr<ID3D11Device> device_;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
+  Microsoft::WRL::ComPtr<ID3D11VideoDevice> video_device_;
+  Microsoft::WRL::ComPtr<ID3D11VideoContext> video_context_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> vp_enum_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessor> vp_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> clean_bgra_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> clean_input_view_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> composited_bgra_;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> composited_input_view_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> cursor_staging_;
+  HDC cursor_dc_ = nullptr;
+  HBITMAP cursor_bmp_ = nullptr;
+  HGDIOBJ cursor_prev_bmp_ = nullptr;
+  void* cursor_bits_ = nullptr;
+  std::shared_ptr<GpuNv12Pool> pool_;
+  uint32_t src_w_ = 0;
+  uint32_t src_h_ = 0;
+  uint32_t vis_w_ = 0;
+  uint32_t vis_h_ = 0;
+  uint32_t tex_w_ = 0;
+  uint32_t tex_h_ = 0;
+  uint32_t frame_index_ = 0;
+};
 
 ScreenCapturerDxgi::ScreenCapturerDxgi() {}
 ScreenCapturerDxgi::~ScreenCapturerDxgi() {
@@ -243,7 +927,7 @@ bool ScreenCapturerDxgi::CreateDuplicationForMonitor(int monitor_index) {
     return false;
   }
 
-  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
 #ifdef _DEBUG
   flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
@@ -258,9 +942,24 @@ bool ScreenCapturerDxgi::CreateDuplicationForMonitor(int monitor_index) {
       feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
       output_device.GetAddressOf(), &out_level, output_context.GetAddressOf());
   if (FAILED(hr)) {
+    UINT fallback_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#ifdef _DEBUG
+    fallback_flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+    hr = D3D11CreateDevice(
+        output_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, fallback_flags,
+        feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
+        output_device.GetAddressOf(), &out_level,
+        output_context.GetAddressOf());
+  }
+  if (FAILED(hr)) {
     LOG_ERROR("DXGI: create D3D device for output adapter {} failed, hr={}",
               monitor_index, (int)hr);
     return false;
+  }
+  Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
+  if (SUCCEEDED(output_device.As(&multithread)) && multithread) {
+    multithread->SetMultithreadProtected(TRUE);
   }
   d3d_context_ = std::move(output_context);
   d3d_device_ = std::move(output_device);
@@ -304,6 +1003,7 @@ void ScreenCapturerDxgi::ReleaseDuplication() {
   // Only the live duplication owns the shared pointer-plane state.
   if (duplication_) SharedDxgiCursorState().Reset();
   ++duplication_generation_;
+  gpu_converter_.reset();
   staging_.Reset();
   ReleaseAcquiredFrame();
   duplication_.Reset();
@@ -428,9 +1128,32 @@ void ScreenCapturerDxgi::CaptureLoop() {
   auto next_topology_check = std::chrono::steady_clock::now();
   unsigned acquire_failures = 0;
   auto cursor_revision = SharedDxgiCursorState().CursorVisibilityRevision();
+  struct GpuFrameHolder {
+    GpuNv12Frame* frame = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    ~GpuFrameHolder() { Reset(); }
+    void Reset() {
+      if (frame) {
+        frame->Release();
+        frame = nullptr;
+      }
+      width = height = 0;
+    }
+    void Set(GpuNv12Frame* next, uint32_t w, uint32_t h) {
+      if (frame) frame->Release();
+      frame = next;
+      width = w;
+      height = h;
+    }
+  } cached_gpu_frame;
+  auto clear_cached = [&] {
+    cached_frame_valid = false;
+    cached_gpu_frame.Reset();
+  };
   while (running_) {
     if (paused_) {
-      cached_frame_valid = false;
+      clear_cached();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
@@ -451,7 +1174,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
       next_topology_check = now + std::chrono::milliseconds(500);
       const bool changed = EnumerateDisplays();
       if (changed || refresh || !duplication_) {
-        cached_frame_valid = false;
+        clear_cached();
         ReleaseDuplication();
         CreateDuplicationForMonitor(monitor_index_.load());
         capture_lock.unlock();
@@ -462,7 +1185,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
       }
     }
     if (!duplication_) {
-      cached_frame_valid = false;
+      clear_cached();
       capture_lock.unlock();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
@@ -471,13 +1194,44 @@ void ScreenCapturerDxgi::CaptureLoop() {
     const int frame_monitor = monitor_index_.load();
     const auto deliver_cached = [&] {
       if (!cached_frame_valid || cached_generation != duplication_generation_ ||
-          cached_monitor != monitor_index_.load() || !callback_ || !nv12_frame_)
+          cached_monitor != monitor_index_.load() || !callback_)
         return;
+      if (cached_gpu_frame.frame) {
+        if ((show_cursor_.load(std::memory_order_relaxed) ||
+             cached_cursor_embedded) &&
+            gpu_converter_ && gpu_converter_->HasCleanBgra()) {
+          GpuNv12Frame* rebuilt = nullptr;
+          if (gpu_converter_->ConvertFromClean(
+                  cached_monitor, display_info_list_,
+                  show_cursor_.load(std::memory_order_relaxed),
+                  &cached_cursor_embedded, &rebuilt)) {
+            cached_gpu_frame.Set(rebuilt, cached_gpu_frame.width,
+                                 cached_gpu_frame.height);
+          } else {
+            cached_gpu_frame.Reset();
+          }
+        }
+        if (cached_gpu_frame.frame) {
+          GpuNv12Frame* emit_frame = cached_gpu_frame.frame;
+          emit_frame->AddRef();
+          const uint32_t ew = cached_gpu_frame.width;
+          const uint32_t eh = cached_gpu_frame.height;
+          const auto stream_id = MakeDisplayStreamId(cached_monitor);
+          capture_lock.unlock();
+          CapturedCursorFrameScope cursor_scope(cached_cursor_embedded);
+          callback_(nullptr, static_cast<int>(emit_frame->LogicalSize()),
+                    static_cast<int>(ew), static_cast<int>(eh),
+                    stream_id.c_str(), emit_frame->Descriptor());
+          emit_frame->Release();
+          return;
+        }
+      }
+      if (!nv12_frame_) return;
       // Recompose from the clean staging texture while showing a cursor, or
       // once after disabling it. Never replay a baked-in stale cursor.
       if ((show_cursor_.load(std::memory_order_relaxed) || cached_cursor_embedded) &&
           !ConvertFrame(cached_monitor, &cached_cursor_embedded, cursor_compositor)) {
-        cached_frame_valid = false;
+        clear_cached();
         return;
       }
       const auto stream_id = MakeDisplayStreamId(cached_monitor);
@@ -499,7 +1253,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
     // Never replay a cached image after an acquisition/conversion failure or
     // a backend rebuild. Display recovery retains the session privacy state.
     if (FAILED(hr)) {
-      cached_frame_valid = false;
+      clear_cached();
       LOG_ERROR("DXGI: AcquireNextFrame failed, hr={}", (int)hr);
       ReleaseDuplication();
       // A single ACCESS_LOST (mode switch, fullscreen toggle, UAC return) is
@@ -527,7 +1281,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
     // its surface. Keep the last confirmed desktop until a present arrives.
     if (frame_info.LastPresentTime.QuadPart == 0) {
       if (FAILED(ReleaseAcquiredFrame())) {
-        cached_frame_valid = false;
+        clear_cached();
         ReleaseDuplication();
         next_topology_check = std::chrono::steady_clock::now();
       } else {
@@ -535,7 +1289,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
       }
       continue;
     }
-    cached_frame_valid = false;
+    clear_cached();
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> acquired_tex;
     if (desktop_resource) {
@@ -550,29 +1304,50 @@ void ScreenCapturerDxgi::CaptureLoop() {
       continue;
     }
 
-    D3D11_TEXTURE2D_DESC src_desc{};
-    acquired_tex->GetDesc(&src_desc);
-
-    if (!staging_) {
-      D3D11_TEXTURE2D_DESC staging_desc = src_desc;
-      staging_desc.Usage = D3D11_USAGE_STAGING;
-      staging_desc.BindFlags = 0;
-      staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-      staging_desc.MiscFlags = 0;
-      hr = d3d_device_->CreateTexture2D(&staging_desc, nullptr,
-                                        staging_.GetAddressOf());
-      if (FAILED(hr)) {
-        LOG_ERROR("DXGI: CreateTexture2D staging failed, hr={}", (int)hr);
-        ReleaseAcquiredFrame();
-        continue;
+    bool cursor_embedded = false;
+    GpuNv12Frame* gpu_frame = nullptr;
+    uint32_t gpu_w = 0, gpu_h = 0;
+    if (rotation_ == DXGI_MODE_ROTATION_IDENTITY) {
+      if (!gpu_converter_ && d3d_device_ && d3d_context_) {
+        gpu_converter_ = std::make_unique<DxgiGpuNv12Converter>(d3d_device_,
+                                                                d3d_context_);
+      }
+      if (gpu_converter_ &&
+          !gpu_converter_->CaptureAndConvert(
+              acquired_tex.Get(), frame_monitor, display_info_list_,
+              show_cursor_.load(std::memory_order_relaxed), &cursor_embedded,
+              &gpu_frame, &gpu_w, &gpu_h)) {
+        if (gpu_frame) {
+          gpu_frame->Release();
+          gpu_frame = nullptr;
+        }
       }
     }
 
-    d3d_context_->CopyResource(staging_.Get(), acquired_tex.Get());
+    bool converted = (gpu_frame != nullptr);
+    if (!converted) {
+      D3D11_TEXTURE2D_DESC src_desc{};
+      acquired_tex->GetDesc(&src_desc);
 
-    bool cursor_embedded = false;
-    const bool converted =
-        ConvertFrame(frame_monitor, &cursor_embedded, cursor_compositor);
+      if (!staging_) {
+        D3D11_TEXTURE2D_DESC staging_desc = src_desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_desc.MiscFlags = 0;
+        hr = d3d_device_->CreateTexture2D(&staging_desc, nullptr,
+                                          staging_.GetAddressOf());
+        if (FAILED(hr)) {
+          LOG_ERROR("DXGI: CreateTexture2D staging failed, hr={}", (int)hr);
+          ReleaseAcquiredFrame();
+          continue;
+        }
+      }
+
+      d3d_context_->CopyResource(staging_.Get(), acquired_tex.Get());
+      converted =
+          ConvertFrame(frame_monitor, &cursor_embedded, cursor_compositor);
+    }
 
     const std::string stream_id = MakeDisplayStreamId(frame_monitor);
     cached_generation = duplication_generation_;
@@ -594,6 +1369,10 @@ void ScreenCapturerDxgi::CaptureLoop() {
     // A mode/desktop transition can invalidate the acquire during readback.
     // Do not publish that frame if releasing it reports the lost capture.
     if (FAILED(ReleaseAcquiredFrame())) {
+      if (gpu_frame) {
+        gpu_frame->Release();
+        gpu_frame = nullptr;
+      }
       ReleaseDuplication();
       next_topology_check = std::chrono::steady_clock::now();
       continue;
@@ -602,11 +1381,20 @@ void ScreenCapturerDxgi::CaptureLoop() {
 
     if (converted && frame_monitor == monitor_index_.load() && callback_) {
       CapturedCursorFrameScope cursor_scope(cursor_embedded);
-      callback_(nv12_frame_, nv12_width_ * nv12_height_ * 3 / 2, nv12_width_,
-                nv12_height_, stream_id.c_str(), nullptr);
+      if (gpu_frame) {
+        callback_(nullptr, static_cast<int>(gpu_frame->LogicalSize()),
+                  static_cast<int>(gpu_w), static_cast<int>(gpu_h),
+                  stream_id.c_str(), gpu_frame->Descriptor());
+        cached_gpu_frame.Set(gpu_frame, gpu_w, gpu_h);
+      } else {
+        callback_(nv12_frame_, nv12_width_ * nv12_height_ * 3 / 2, nv12_width_,
+                  nv12_height_, stream_id.c_str(), nullptr);
+      }
       cached_cursor_embedded = cursor_embedded;
       cached_monitor = frame_monitor;
       cached_frame_valid = true;
+    } else if (gpu_frame) {
+      gpu_frame->Release();
     }
   }
 }
