@@ -1,5 +1,8 @@
 #include "screen_capturer_dxgi.h"
 
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+
 #include <display_stream_id.h>
 
 #include <algorithm>
@@ -742,6 +745,7 @@ int ScreenCapturerDxgi::Init(const int fps, cb_desktop_data cb) {
 int ScreenCapturerDxgi::Destroy() {
   Stop();
   ReleaseDuplication();
+  gpu_converter_.reset();
   outputs_.clear();
   display_info_list_.clear();
   display_slots_.Reset();
@@ -926,43 +930,8 @@ bool ScreenCapturerDxgi::CreateDuplicationForMonitor(int monitor_index) {
               (int)hr);
     return false;
   }
-
-  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-#ifdef _DEBUG
-  flags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
-  D3D_FEATURE_LEVEL feature_levels[] = {
-      D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
-      D3D_FEATURE_LEVEL_10_0};
-  D3D_FEATURE_LEVEL out_level{};
-  Microsoft::WRL::ComPtr<ID3D11Device> output_device;
-  Microsoft::WRL::ComPtr<ID3D11DeviceContext> output_context;
-  hr = D3D11CreateDevice(
-      output_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-      feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
-      output_device.GetAddressOf(), &out_level, output_context.GetAddressOf());
-  if (FAILED(hr)) {
-    UINT fallback_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-#ifdef _DEBUG
-    fallback_flags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
-    hr = D3D11CreateDevice(
-        output_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, fallback_flags,
-        feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
-        output_device.GetAddressOf(), &out_level,
-        output_context.GetAddressOf());
-  }
-  if (FAILED(hr)) {
-    LOG_ERROR("DXGI: create D3D device for output adapter {} failed, hr={}",
-              monitor_index, (int)hr);
-    return false;
-  }
-  Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
-  if (SUCCEEDED(output_device.As(&multithread)) && multithread) {
-    multithread->SetMultithreadProtected(TRUE);
-  }
-  d3d_context_ = std::move(output_context);
-  d3d_device_ = std::move(output_device);
+  DXGI_ADAPTER_DESC adapter_desc{};
+  output_adapter->GetDesc(&adapter_desc);
 
   Microsoft::WRL::ComPtr<IDXGIOutput1> output1;
   hr = outputs_[monitor_index]->QueryInterface(
@@ -973,18 +942,82 @@ bool ScreenCapturerDxgi::CreateDuplicationForMonitor(int monitor_index) {
   }
 
   duplication_.Reset();
-  hr = output1->DuplicateOutput(d3d_device_.Get(), duplication_.GetAddressOf());
-  if (FAILED(hr)) {
-    LOG_ERROR("DXGI: DuplicateOutput failed, hr={}", (int)hr);
-    return false;
+  bool reused_device = false;
+  if (d3d_device_ && d3d_context_ &&
+      SUCCEEDED(d3d_device_->GetDeviceRemovedReason())) {
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> current_adapter;
+    DXGI_ADAPTER_DESC current_desc{};
+    if (SUCCEEDED(d3d_device_.As(&dxgi_device)) && dxgi_device &&
+        SUCCEEDED(dxgi_device->GetAdapter(current_adapter.GetAddressOf())) &&
+        current_adapter && SUCCEEDED(current_adapter->GetDesc(&current_desc)) &&
+        current_desc.AdapterLuid.LowPart == adapter_desc.AdapterLuid.LowPart &&
+        current_desc.AdapterLuid.HighPart ==
+            adapter_desc.AdapterLuid.HighPart) {
+      hr = output1->DuplicateOutput(d3d_device_.Get(),
+                                    duplication_.GetAddressOf());
+      if (SUCCEEDED(hr) && duplication_) {
+        reused_device = true;
+      }
+    }
+  }
+
+  if (!reused_device) {
+    gpu_converter_.reset();
+    d3d_context_.Reset();
+    d3d_device_.Reset();
+
+    UINT flags =
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+#ifdef _DEBUG
+    flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+    D3D_FEATURE_LEVEL feature_levels[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0};
+    D3D_FEATURE_LEVEL out_level{};
+    Microsoft::WRL::ComPtr<ID3D11Device> output_device;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> output_context;
+    hr = D3D11CreateDevice(
+        output_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+        feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
+        output_device.GetAddressOf(), &out_level,
+        output_context.GetAddressOf());
+    if (FAILED(hr)) {
+      UINT fallback_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#ifdef _DEBUG
+      fallback_flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+      hr = D3D11CreateDevice(
+          output_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+          fallback_flags, feature_levels, ARRAYSIZE(feature_levels),
+          D3D11_SDK_VERSION, output_device.GetAddressOf(), &out_level,
+          output_context.GetAddressOf());
+    }
+    if (FAILED(hr)) {
+      LOG_ERROR("DXGI: create D3D device for output adapter {} failed, hr={}",
+                monitor_index, (int)hr);
+      return false;
+    }
+    Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
+    if (SUCCEEDED(output_device.As(&multithread)) && multithread) {
+      multithread->SetMultithreadProtected(TRUE);
+    }
+    d3d_context_ = std::move(output_context);
+    d3d_device_ = std::move(output_device);
+
+    hr = output1->DuplicateOutput(d3d_device_.Get(),
+                                  duplication_.GetAddressOf());
+    if (FAILED(hr)) {
+      LOG_ERROR("DXGI: DuplicateOutput failed, hr={}", (int)hr);
+      return false;
+    }
   }
 
   staging_.Reset();
   DXGI_OUTDUPL_DESC desc{};
   duplication_->GetDesc(&desc);
   rotation_ = desc.Rotation;
-  DXGI_ADAPTER_DESC adapter_desc{};
-  output_adapter->GetDesc(&adapter_desc);
   DXGI_OUTPUT_DESC output_desc{};
   software_cursor_output_ =
       SUCCEEDED(outputs_[monitor_index]->GetDesc(&output_desc)) &&
@@ -1003,7 +1036,6 @@ void ScreenCapturerDxgi::ReleaseDuplication() {
   // Only the live duplication owns the shared pointer-plane state.
   if (duplication_) SharedDxgiCursorState().Reset();
   ++duplication_generation_;
-  gpu_converter_.reset();
   staging_.Reset();
   ReleaseAcquiredFrame();
   duplication_.Reset();
@@ -1119,8 +1151,18 @@ bool ScreenCapturerDxgi::ConvertFrame(int frame_monitor, bool* cursor_embedded,
 
 void ScreenCapturerDxgi::CaptureLoop() {
   ScopedWindowsPhysicalCoordinates physical_coordinates;
+  struct ScopedTimerPeriod {
+    bool active = false;
+    ScopedTimerPeriod() { active = (timeBeginPeriod(1) == TIMERR_NOERROR); }
+    ~ScopedTimerPeriod() {
+      if (active) timeEndPeriod(1);
+    }
+  } timer_period;
   CursorFrameCompositor cursor_compositor;
-  const int timeout_ms = (std::max)(1, 1000 / (std::max)(1, fps_));
+  const auto frame_interval =
+      std::chrono::nanoseconds(1'000'000'000) / (std::max)(1, fps_);
+  auto next_frame_deadline = std::chrono::steady_clock::now();
+  bool synced_to_vsync = false;
   bool cached_frame_valid = false;
   bool cached_cursor_embedded = false;
   int cached_monitor = -1;
@@ -1154,6 +1196,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
   while (running_) {
     if (paused_) {
       clear_cached();
+      synced_to_vsync = false;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
@@ -1175,10 +1218,11 @@ void ScreenCapturerDxgi::CaptureLoop() {
       const bool changed = EnumerateDisplays();
       if (changed || refresh || !duplication_) {
         clear_cached();
+        synced_to_vsync = false;
         ReleaseDuplication();
         CreateDuplicationForMonitor(monitor_index_.load());
         capture_lock.unlock();
-        if (callback_)
+        if ((changed || refresh) && callback_)
           callback_(nullptr, ScreenCapturer::kDisplayTopologyChanged,
                     0, 0, "", nullptr);
         continue;
@@ -1186,6 +1230,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
     }
     if (!duplication_) {
       clear_cached();
+      synced_to_vsync = false;
       capture_lock.unlock();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
@@ -1240,13 +1285,32 @@ void ScreenCapturerDxgi::CaptureLoop() {
       callback_(nv12_frame_, nv12_width_ * nv12_height_ * 3 / 2, nv12_width_,
                 nv12_height_, stream_id.c_str(), nullptr);
     };
+    const auto before_acquire = std::chrono::steady_clock::now();
+    const auto wait_deadline =
+        synced_to_vsync
+            ? (next_frame_deadline + std::chrono::milliseconds(3))
+            : next_frame_deadline;
+    int wait_ms = 1;
+    if (wait_deadline > before_acquire) {
+      wait_ms = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              wait_deadline - before_acquire)
+              .count());
+      if (wait_ms < 1) wait_ms = 1;
+    }
     DXGI_OUTDUPL_FRAME_INFO frame_info{};
     Microsoft::WRL::ComPtr<IDXGIResource> desktop_resource;
     HRESULT hr = duplication_->AcquireNextFrame(
-        timeout_ms, &frame_info, desktop_resource.GetAddressOf());
+        wait_ms, &frame_info, desktop_resource.GetAddressOf());
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
       // DXGI explicitly reports an unchanged desktop. Re-emit only a frame
       // successfully acquired for this monitor to keep delivering static frames.
+      synced_to_vsync = false;
+      const auto timeout_now = std::chrono::steady_clock::now();
+      next_frame_deadline += frame_interval;
+      if (next_frame_deadline <= timeout_now) {
+        next_frame_deadline = timeout_now + frame_interval;
+      }
       deliver_cached();
       continue;
     }
@@ -1254,6 +1318,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
     // a backend rebuild. Display recovery retains the session privacy state.
     if (FAILED(hr)) {
       clear_cached();
+      synced_to_vsync = false;
       LOG_ERROR("DXGI: AcquireNextFrame failed, hr={}", (int)hr);
       ReleaseDuplication();
       // A single ACCESS_LOST (mode switch, fullscreen toggle, UAC return) is
@@ -1282,10 +1347,19 @@ void ScreenCapturerDxgi::CaptureLoop() {
     if (frame_info.LastPresentTime.QuadPart == 0) {
       if (FAILED(ReleaseAcquiredFrame())) {
         clear_cached();
+        synced_to_vsync = false;
         ReleaseDuplication();
         next_topology_check = std::chrono::steady_clock::now();
       } else {
-        deliver_cached();
+        const auto after_pointer = std::chrono::steady_clock::now();
+        if (after_pointer + std::chrono::milliseconds(1) >= wait_deadline) {
+          synced_to_vsync = false;
+          next_frame_deadline += frame_interval;
+          if (next_frame_deadline <= after_pointer) {
+            next_frame_deadline = after_pointer + frame_interval;
+          }
+          deliver_cached();
+        }
       }
       continue;
     }
@@ -1380,6 +1454,8 @@ void ScreenCapturerDxgi::CaptureLoop() {
     capture_lock.unlock();
 
     if (converted && frame_monitor == monitor_index_.load() && callback_) {
+      synced_to_vsync = true;
+      next_frame_deadline = std::chrono::steady_clock::now() + frame_interval;
       CapturedCursorFrameScope cursor_scope(cursor_embedded);
       if (gpu_frame) {
         callback_(nullptr, static_cast<int>(gpu_frame->LogicalSize()),

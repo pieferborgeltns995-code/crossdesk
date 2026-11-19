@@ -29,7 +29,7 @@ namespace crossdesk {
 namespace {
 
 constexpr uint64_t kCaptureResumeKeyFrameGapMs = 500;
-constexpr auto kFrameDeadlineTolerance = std::chrono::milliseconds(1);
+constexpr auto kFrameDeadlineTolerance = std::chrono::milliseconds(4);
 #if defined(_WIN32) || defined(__OHOS__)
 constexpr auto kKeyboardCaptureRetryDelay = std::chrono::seconds(1);
 #endif
