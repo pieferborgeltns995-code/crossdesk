@@ -8,18 +8,6 @@
 #include <memory>
 #include <utility>
 
-@interface CrossDeskStreamFullscreenTarget : NSObject
-- (void)toggleStreamFullscreen:(id)sender;
-@end
-
-@implementation CrossDeskStreamFullscreenTarget
-- (void)toggleStreamFullscreen:(id)sender {
-  (void)sender;
-  crossdesk::SetStreamWindowFullscreen(
-      !crossdesk::IsStreamWindowFullscreen());
-}
-@end
-
 namespace crossdesk {
 namespace {
 
@@ -30,19 +18,11 @@ NSWindowStyleMask gallery_restore_style = NSWindowStyleMaskTitled;
 NSApplicationPresentationOptions gallery_restore_presentation;
 __weak NSWindow *stream_window = nil;
 __weak NSView *stream_slint_view = nil;
-CrossDeskStreamFullscreenTarget *stream_fullscreen_target = nil;
 bool stream_fullscreen = false;
-NSRect stream_restore_frame = NSZeroRect;
-NSWindowStyleMask stream_restore_style_mask = NSWindowStyleMaskTitled;
-NSWindowTitleVisibility stream_restore_title_visibility =
-    NSWindowTitleVisible;
-BOOL stream_restore_titlebar_transparent = NO;
-BOOL stream_restore_movable = YES;
-BOOL stream_restore_close_hidden = NO;
-BOOL stream_restore_miniaturize_hidden = NO;
-BOOL stream_restore_zoom_hidden = NO;
-NSApplicationPresentationOptions stream_restore_presentation_options =
-    NSApplicationPresentationDefault;
+id stream_will_enter_fs_observer = nil;
+id stream_did_enter_fs_observer = nil;
+id stream_will_exit_fs_observer = nil;
+id stream_did_exit_fs_observer = nil;
 
 struct FileDialogRequest {
   std::string title;
@@ -63,18 +43,65 @@ NSOpenPanel *CreateFileDialog() {
   return panel;
 }
 
-void InstallStreamFullscreenButton(NSWindow *window) {
+void RemoveStreamFullscreenObservers() {
+  NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+  if (stream_will_enter_fs_observer != nil) {
+    [center removeObserver:stream_will_enter_fs_observer];
+    stream_will_enter_fs_observer = nil;
+  }
+  if (stream_did_enter_fs_observer != nil) {
+    [center removeObserver:stream_did_enter_fs_observer];
+    stream_did_enter_fs_observer = nil;
+  }
+  if (stream_will_exit_fs_observer != nil) {
+    [center removeObserver:stream_will_exit_fs_observer];
+    stream_will_exit_fs_observer = nil;
+  }
+  if (stream_did_exit_fs_observer != nil) {
+    [center removeObserver:stream_did_exit_fs_observer];
+    stream_did_exit_fs_observer = nil;
+  }
+}
+
+void InstallStreamFullscreenObservers(NSWindow *window) {
+  RemoveStreamFullscreenObservers();
   if (window == nil) {
     return;
   }
-  if (stream_fullscreen_target == nil) {
-    stream_fullscreen_target =
-        [[CrossDeskStreamFullscreenTarget alloc] init];
-  }
-  NSButton *zoom_button =
-      [window standardWindowButton:NSWindowZoomButton];
-  zoom_button.target = stream_fullscreen_target;
-  zoom_button.action = @selector(toggleStreamFullscreen:);
+  NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+  NSOperationQueue *main_queue = [NSOperationQueue mainQueue];
+  stream_will_enter_fs_observer = [center
+      addObserverForName:NSWindowWillEnterFullScreenNotification
+                  object:window
+                   queue:main_queue
+              usingBlock:^(NSNotification *note) {
+                (void)note;
+                stream_fullscreen = true;
+              }];
+  stream_did_enter_fs_observer = [center
+      addObserverForName:NSWindowDidEnterFullScreenNotification
+                  object:window
+                   queue:main_queue
+              usingBlock:^(NSNotification *note) {
+                (void)note;
+                stream_fullscreen = true;
+              }];
+  stream_will_exit_fs_observer = [center
+      addObserverForName:NSWindowWillExitFullScreenNotification
+                  object:window
+                   queue:main_queue
+              usingBlock:^(NSNotification *note) {
+                (void)note;
+                stream_fullscreen = false;
+              }];
+  stream_did_exit_fs_observer = [center
+      addObserverForName:NSWindowDidExitFullScreenNotification
+                  object:window
+                   queue:main_queue
+              usingBlock:^(NSNotification *note) {
+                (void)note;
+                stream_fullscreen = false;
+              }];
 }
 
 void SetTitlebarButtonsHidden(NSWindow *window, BOOL hidden) {
@@ -288,16 +315,16 @@ bool ConfigureStreamWindowLiveResize(void *opaque_slint_view) {
     stream_slint_view = slint_view;
     window.tabbingMode = NSWindowTabbingModeDisallowed;
     window.excludedFromWindowsMenu = NO;
-    // Native Space fullscreen cross-fades an AppKit source snapshot over a
-    // separately rendered destination window. Disable that path for the
-    // stream window and route the green button to the immediate transition.
+    // Use native macOS Space fullscreen for the stream window so the system
+    // menu bar / notch area turns black and Space gestures work natively.
     window.collectionBehavior =
         (window.collectionBehavior &
-         ~(NSWindowCollectionBehaviorFullScreenPrimary |
-           NSWindowCollectionBehaviorFullScreenAuxiliary |
-           NSWindowCollectionBehaviorFullScreenAllowsTiling)) |
-        NSWindowCollectionBehaviorFullScreenNone;
-    InstallStreamFullscreenButton(window);
+         ~(NSWindowCollectionBehaviorFullScreenNone |
+           NSWindowCollectionBehaviorFullScreenAuxiliary)) |
+        NSWindowCollectionBehaviorFullScreenPrimary;
+    stream_fullscreen =
+        (window.styleMask & NSWindowStyleMaskFullScreen) != 0;
+    InstallStreamFullscreenObservers(window);
     content_view.needsDisplay = YES;
     return true;
   }
@@ -309,18 +336,10 @@ void UnregisterStreamWindow(void *opaque_slint_view) {
     if (slint_view == nil || slint_view != stream_slint_view) {
       return;
     }
+    RemoveStreamFullscreenObservers();
     stream_window = nil;
     stream_slint_view = nil;
     stream_fullscreen = false;
-    stream_restore_frame = NSZeroRect;
-    stream_restore_style_mask = NSWindowStyleMaskTitled;
-    stream_restore_title_visibility = NSWindowTitleVisible;
-    stream_restore_titlebar_transparent = NO;
-    stream_restore_movable = YES;
-    stream_restore_close_hidden = NO;
-    stream_restore_miniaturize_hidden = NO;
-    stream_restore_zoom_hidden = NO;
-    stream_restore_presentation_options = NSApplicationPresentationDefault;
   }
 }
 
@@ -333,81 +352,24 @@ bool IsStreamWindowActive() {
 
 bool SetStreamWindowFullscreen(bool fullscreen) {
   @autoreleasepool {
-    if (stream_window == nil || stream_fullscreen == fullscreen) {
-      return stream_window != nil;
+    if (stream_window == nil) {
+      return false;
     }
-
-    if (fullscreen) {
-      NSScreen *screen = stream_window.screen ?: NSScreen.mainScreen;
-      if (screen == nil) {
-        return false;
-      }
-
-      stream_restore_frame = stream_window.frame;
-      stream_restore_style_mask = stream_window.styleMask;
-      stream_restore_title_visibility = stream_window.titleVisibility;
-      stream_restore_titlebar_transparent =
-          stream_window.titlebarAppearsTransparent;
-      stream_restore_movable = stream_window.movable;
-      stream_restore_close_hidden =
-          [stream_window standardWindowButton:NSWindowCloseButton].hidden;
-      stream_restore_miniaturize_hidden =
-          [stream_window standardWindowButton:NSWindowMiniaturizeButton].hidden;
-      stream_restore_zoom_hidden =
-          [stream_window standardWindowButton:NSWindowZoomButton].hidden;
-      stream_restore_presentation_options = NSApp.presentationOptions;
-
-      stream_fullscreen = true;
-      stream_window.styleMask =
-          stream_restore_style_mask | NSWindowStyleMaskFullSizeContentView;
-      stream_window.titleVisibility = NSWindowTitleHidden;
-      stream_window.titlebarAppearsTransparent = YES;
-      stream_window.movable = NO;
-      SetTitlebarButtonsHidden(stream_window, YES);
-
-      NSApplicationPresentationOptions presentation_options =
-          stream_restore_presentation_options;
-      if ((presentation_options & (NSApplicationPresentationHideDock |
-                                   NSApplicationPresentationAutoHideDock)) ==
-          0) {
-        presentation_options |= NSApplicationPresentationAutoHideDock;
-      }
-      if ((presentation_options & (NSApplicationPresentationHideMenuBar |
-                                   NSApplicationPresentationAutoHideMenuBar)) ==
-          0) {
-        presentation_options |= NSApplicationPresentationAutoHideMenuBar;
-      }
-      NSApp.presentationOptions = presentation_options;
-      [stream_window setFrame:screen.frame display:YES animate:NO];
-      [stream_window makeKeyAndOrderFront:nil];
-    } else {
-      stream_fullscreen = false;
-      NSApp.presentationOptions = stream_restore_presentation_options;
-      stream_window.styleMask = stream_restore_style_mask;
-      stream_window.titleVisibility = stream_restore_title_visibility;
-      stream_window.titlebarAppearsTransparent =
-          stream_restore_titlebar_transparent;
-      stream_window.movable = stream_restore_movable;
-      [stream_window setFrame:stream_restore_frame display:YES animate:NO];
-      [stream_window standardWindowButton:NSWindowCloseButton].hidden =
-          stream_restore_close_hidden;
-      [stream_window standardWindowButton:NSWindowMiniaturizeButton].hidden =
-          stream_restore_miniaturize_hidden;
-      [stream_window standardWindowButton:NSWindowZoomButton].hidden =
-          stream_restore_zoom_hidden;
-      InstallStreamFullscreenButton(stream_window);
-      [stream_window makeKeyAndOrderFront:nil];
+    if (stream_fullscreen == fullscreen) {
+      return true;
     }
-
-    stream_window.contentView.alphaValue = 1.0;
-    stream_window.contentView.needsDisplay = YES;
-    [stream_window displayIfNeeded];
+    [stream_window toggleFullScreen:nil];
     return true;
   }
 }
 
 bool IsStreamWindowFullscreen() {
-  return stream_fullscreen;
+  @autoreleasepool {
+    if (stream_window == nil) {
+      return false;
+    }
+    return stream_fullscreen;
+  }
 }
 
 void ShowFileTransferNotification(void* slint_view,
