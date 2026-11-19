@@ -225,6 +225,7 @@ jobs:
 
   # macOS
   build-macos:
+    if: false
     name: Build on macOS
     needs: prepare-version
     runs-on: ${{ matrix.runner }}
@@ -411,7 +412,6 @@ jobs:
 
   # Windows
   build-windows-x64:
-    if: false
     name: Build on Windows x64
     needs: prepare-version
     runs-on: windows-2022
