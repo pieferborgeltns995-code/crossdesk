@@ -225,7 +225,6 @@ jobs:
 
   # macOS
   build-macos:
-    if: false
     name: Build on macOS
     needs: prepare-version
     runs-on: ${{ matrix.runner }}
