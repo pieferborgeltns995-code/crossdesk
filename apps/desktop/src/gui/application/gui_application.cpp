@@ -1136,6 +1136,10 @@ struct GuiApplication::SlintUi {
   server_window_state::EdgeLayout server_layout{};
   int localized_language = -1;
   std::chrono::steady_clock::time_point last_clipboard_poll{};
+  float scroll_accum_x = 0.0f;
+  float scroll_accum_y = 0.0f;
+  std::chrono::steady_clock::time_point last_scroll_time{};
+  std::string last_scroll_remote_id;
   slint::Timer video_timer;
 #if defined(__APPLE__)
   MacVideoFrameScheduler video_scheduler;
@@ -5771,16 +5775,47 @@ void GuiApplication::SendScrollInput(float delta_x, float delta_y, float x,
   if (!point) {
     return;
   }
+  const auto now = std::chrono::steady_clock::now();
+  if (ui_->last_scroll_remote_id != props->remote_id_ ||
+      (ui_->last_scroll_time != std::chrono::steady_clock::time_point{} &&
+       now - ui_->last_scroll_time > std::chrono::milliseconds(250))) {
+    ui_->scroll_accum_x = 0.0f;
+    ui_->scroll_accum_y = 0.0f;
+  }
+  ui_->last_scroll_time = now;
+  ui_->last_scroll_remote_id = props->remote_id_;
+
+  constexpr float kDiscreteDeltaThreshold = 12.0f;
+  constexpr float kTrackpadStepPixels = 36.0f;
+  auto consume_scroll = [](float delta, float& accum) -> int {
+    if (delta == 0.0f) return 0;
+    if ((accum > 0.0f && delta < 0.0f) || (accum < 0.0f && delta > 0.0f)) {
+      accum = 0.0f;
+    }
+    if (std::abs(delta) >= kDiscreteDeltaThreshold &&
+        std::abs(accum) < kDiscreteDeltaThreshold) {
+      accum = 0.0f;
+      return delta > 0.0f ? 1 : -1;
+    }
+    accum += delta;
+    if (std::abs(accum) >= kTrackpadStepPixels) {
+      const int steps = static_cast<int>(accum / kTrackpadStepPixels);
+      accum -= static_cast<float>(steps) * kTrackpadStepPixels;
+      return std::clamp(steps, -3, 3);
+    }
+    return 0;
+  };
+
   RemoteAction action{};
   action.type = ControlType::mouse;
   action.m.x = point->x;
   action.m.y = point->y;
   if (std::abs(delta_y) >= std::abs(delta_x)) {
     action.m.flag = MouseFlag::wheel_vertical;
-    action.m.s = delta_y > 0 ? 1 : delta_y < 0 ? -1 : 0;
+    action.m.s = consume_scroll(delta_y, ui_->scroll_accum_y);
   } else {
     action.m.flag = MouseFlag::wheel_horizontal;
-    action.m.s = delta_x > 0 ? 1 : delta_x < 0 ? -1 : 0;
+    action.m.s = consume_scroll(delta_x, ui_->scroll_accum_x);
   }
   if (action.m.s == 0) {
     return;
