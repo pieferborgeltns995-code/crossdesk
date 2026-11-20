@@ -299,6 +299,14 @@ jobs:
       - name: Update xmake repositories
         run: xmake repo -u
 
+      - name: Fallback from aria2c to curl for GitHub patch downloads
+        shell: bash
+        run: |
+          if command -v aria2c >/dev/null 2>&1; then
+            brew unlink aria2 || sudo rm -f "$(command -v aria2c)" || true
+          fi
+          rm -f /opt/homebrew/bin/aria2c /usr/local/bin/aria2c || true
+
       - name: Build CrossDesk
         run: |
           xmake f --target_minver=${MACOSX_DEPLOYMENT_TARGET} --CROSSDESK_VERSION=${VERSION_NUM} --USE_CUDA=false -vyD
