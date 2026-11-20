@@ -4400,34 +4400,21 @@ void GuiApplication::ScheduleNextVideoFrame() {
     return;
   }
 
-  constexpr auto frame_interval = std::chrono::nanoseconds(1'000'000'000 / 60);
-  const auto now = std::chrono::steady_clock::now();
-  if (next_video_frame_time_ == std::chrono::steady_clock::time_point{} ||
-      now - next_video_frame_time_ > 250ms) {
-    next_video_frame_time_ = now;
+  const bool frame_dirty =
+      video_frame_dirty_.exchange(false, std::memory_order_acq_rel);
+  const bool native_render_needed = ui_->stream && ui_->video_presenter &&
+                                    ui_->video_presenter->NeedsRedraw();
+  if (frame_dirty || native_render_needed) {
+    SyncStreamVideoFrame();
   }
 
-  if (now >= next_video_frame_time_) {
-    const bool frame_dirty =
-        video_frame_dirty_.exchange(false, std::memory_order_acq_rel);
-    const bool native_render_needed = ui_->stream && ui_->video_presenter &&
-                                      ui_->video_presenter->NeedsRedraw();
-    if (frame_dirty || native_render_needed) {
-      SyncStreamVideoFrame();
-    }
-    do {
-      next_video_frame_time_ += frame_interval;
-    } while (next_video_frame_time_ <= now);
-  }
-
-  const auto after_render = std::chrono::steady_clock::now();
-  const auto remaining = std::max(next_video_frame_time_ - after_render,
-                                  std::chrono::steady_clock::duration::zero());
-  const auto delay_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count();
-  const auto delay_ms = std::max<int64_t>(1, (delay_ns + 999'999) / 1'000'000);
-  ui_->video_timer.start(slint::TimerMode::SingleShot,
-                         std::chrono::milliseconds(delay_ms),
+  // Avoid rounding a 16.67ms frame interval up to 17ms+, which slips past VSync
+  // and drops 60fps down to ~40fps. Poll at 4ms only while a stream is focused
+  // so incoming decoded frames present cleanly on the next VSync without churn.
+  const bool stream_active =
+      ui_->stream && !focused_remote_id_.empty() && ui_->gallery_control_id.empty();
+  const auto poll_delay = stream_active ? 4ms : 16ms;
+  ui_->video_timer.start(slint::TimerMode::SingleShot, poll_delay,
                          [this] { ScheduleNextVideoFrame(); });
 }
 

@@ -143,7 +143,6 @@ private:
   std::unordered_map<std::string, CursorDeliveryState>
       cursor_delivery_states_;
   uint32_t cursor_state_sequence_ = 0;
-  std::chrono::steady_clock::time_point next_video_frame_time_{};
   SignalConnectionIndicator signal_connection_indicator_;
 #if (defined(__linux__) && !defined(__OHOS__)) && !defined(__APPLE__)
   bool use_xwayland_gui_ = false;

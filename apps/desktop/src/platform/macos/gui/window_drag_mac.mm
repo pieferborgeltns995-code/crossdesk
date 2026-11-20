@@ -122,9 +122,34 @@ bool IsCustomFullscreenWindow(id window) {
          (window == gallery_window && gallery_fullscreen);
 }
 
+NSRect FullscreenFrameForScreen(NSScreen *screen) {
+  if (screen == nil) {
+    return NSZeroRect;
+  }
+  NSRect frame = screen.frame;
+  if (@available(macOS 12.0, *)) {
+    const CGFloat notch_inset = screen.safeAreaInsets.top;
+    if (notch_inset > 0.0 && frame.size.height > notch_inset) {
+      // Keep custom non-Space fullscreen below the display notch so the window
+      // does not cross into the notch housing or create asymmetric bottom bars.
+      frame.size.height -= notch_inset;
+    }
+  }
+  return frame;
+}
+
 NSRect CustomFullscreenConstrainFrameRect(id self, SEL cmd, NSRect frame_rect,
                                           NSScreen *screen) {
   if (IsCustomFullscreenWindow(self)) {
+    NSScreen *target_screen =
+        screen ?: ([self isKindOfClass:NSWindow.class]
+                       ? static_cast<NSWindow *>(self).screen
+                       : nil);
+    if (@available(macOS 12.0, *)) {
+      if (target_screen != nil && target_screen.safeAreaInsets.top > 0.0) {
+        return FullscreenFrameForScreen(target_screen);
+      }
+    }
     return frame_rect;
   }
   Class cls = object_getClass(self);
@@ -317,7 +342,9 @@ bool SetGalleryWindowFullscreen(bool fullscreen) {
       ApplyFullscreenPresentation(gallery_window);
       // Let the next event-loop frame paint the updated Slint layout. A
       // synchronous draw here exposes stale grid geometry during the resize.
-      [gallery_window setFrame:screen.frame display:NO animate:NO];
+      [gallery_window setFrame:FullscreenFrameForScreen(screen)
+                         display:NO
+                         animate:NO];
       [gallery_window makeKeyAndOrderFront:nil];
     } else {
       gallery_fullscreen = false;
@@ -467,7 +494,9 @@ bool SetStreamWindowFullscreen(bool fullscreen) {
       SetTitlebarButtonsHidden(stream_window, YES);
 
       ApplyFullscreenPresentation(stream_window);
-      [stream_window setFrame:screen.frame display:YES animate:NO];
+      [stream_window setFrame:FullscreenFrameForScreen(screen)
+                        display:YES
+                        animate:NO];
       [stream_window makeKeyAndOrderFront:nil];
     } else {
       stream_fullscreen = false;
