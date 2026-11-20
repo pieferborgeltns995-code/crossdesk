@@ -28,7 +28,7 @@ struct PreviewBandwidthDemand {
         ? int64_t(width) * height : 3840LL * 2160;
     const int64_t estimate = pixels * std::clamp(fps, 1, 60) * 15 / 100;
     return int(std::clamp<int64_t>((estimate + 49'999) / 50'000 * 50'000,
-                                   150'000, 20'000'000));
+                                   150'000, 50'000'000));
   }
 };
 
