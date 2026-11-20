@@ -80,6 +80,8 @@ class ScreenCapturerDxgi : public ScreenCapturer {
 
   Microsoft::WRL::ComPtr<ID3D11Device> d3d_device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3d_context_;
+  Microsoft::WRL::ComPtr<ID3D11Device> encode_d3d_device_;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> encode_d3d_context_;
   Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication_;
   bool frame_acquired_ = false;  // Guarded by switch_mutex_ while capturing.
   Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;

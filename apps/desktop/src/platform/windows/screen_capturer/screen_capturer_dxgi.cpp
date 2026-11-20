@@ -84,6 +84,66 @@ bool ComputeCursorPatchRect(const CURSORINFO& cursor, int disp_left,
   *out_y1 = static_cast<int>((std::min<int64_t>)(max_h, y1));
   return *out_x1 > *out_x0 && *out_y1 > *out_y0;
 }
+
+bool IsDeviceOnSameAdapter(ID3D11Device* device,
+                           const DXGI_ADAPTER_DESC& adapter_desc) {
+  if (!device || FAILED(device->GetDeviceRemovedReason())) return false;
+  Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+  Microsoft::WRL::ComPtr<IDXGIAdapter> current_adapter;
+  DXGI_ADAPTER_DESC current_desc{};
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(dxgi_device.GetAddressOf()))) ||
+      !dxgi_device ||
+      FAILED(dxgi_device->GetAdapter(current_adapter.GetAddressOf())) ||
+      !current_adapter || FAILED(current_adapter->GetDesc(&current_desc))) {
+    return false;
+  }
+  return current_desc.AdapterLuid.LowPart == adapter_desc.AdapterLuid.LowPart &&
+         current_desc.AdapterLuid.HighPart == adapter_desc.AdapterLuid.HighPart;
+}
+
+bool CreateD3dDeviceOnAdapter(
+    IDXGIAdapter* adapter, bool require_video_support,
+    bool multithread_protected, Microsoft::WRL::ComPtr<ID3D11Device>* out_device,
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext>* out_context) {
+  if (!adapter || !out_device || !out_context) return false;
+  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  if (require_video_support) {
+    flags |= D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+  }
+#ifdef _DEBUG
+  flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+  D3D_FEATURE_LEVEL feature_levels[] = {
+      D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+      D3D_FEATURE_LEVEL_10_0};
+  D3D_FEATURE_LEVEL out_level{};
+  Microsoft::WRL::ComPtr<ID3D11Device> device;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+  HRESULT hr = D3D11CreateDevice(
+      adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, feature_levels,
+      ARRAYSIZE(feature_levels), D3D11_SDK_VERSION, device.GetAddressOf(),
+      &out_level, context.GetAddressOf());
+  if (FAILED(hr) && require_video_support) {
+    UINT fallback_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#ifdef _DEBUG
+    fallback_flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+    hr = D3D11CreateDevice(
+        adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, fallback_flags,
+        feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
+        device.GetAddressOf(), &out_level, context.GetAddressOf());
+  }
+  if (FAILED(hr) || !device || !context) return false;
+  if (multithread_protected) {
+    Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
+    if (SUCCEEDED(device.As(&multithread)) && multithread) {
+      multithread->SetMultithreadProtected(TRUE);
+    }
+  }
+  *out_device = std::move(device);
+  *out_context = std::move(context);
+  return true;
+}
 }  // namespace
 
 class GpuNv12Pool final : public std::enable_shared_from_this<GpuNv12Pool> {
@@ -364,19 +424,25 @@ class DxgiGpuNv12Converter final {
       : device_(std::move(device)), context_(std::move(context)) {}
 
   ~DxgiGpuNv12Converter() {
+    ResetSharedBridge();
     ResetCursorDib();
     if (pool_) pool_->Retire();
   }
 
   bool HasCleanBgra() const { return clean_bgra_ != nullptr && clean_bgra_valid_; }
 
-  bool CaptureAndConvert(ID3D11Texture2D* acquired_tex, int frame_monitor,
+  bool CaptureAndConvert(ID3D11Device* src_device,
+                         ID3D11DeviceContext* src_context,
+                         ID3D11Texture2D* acquired_tex, int frame_monitor,
                          const std::vector<DisplayInfo>& displays,
                          bool show_cursor, bool* cursor_embedded,
                          bool* software_cursor_drawn,
                          GpuNv12Frame** out_frame, uint32_t* out_w,
                          uint32_t* out_h) {
-    if (!acquired_tex || !out_frame || !out_w || !out_h) return false;
+    if (!src_device || !src_context || !acquired_tex || !out_frame || !out_w ||
+        !out_h) {
+      return false;
+    }
     *out_frame = nullptr;
     D3D11_TEXTURE2D_DESC src_desc{};
     acquired_tex->GetDesc(&src_desc);
@@ -389,7 +455,14 @@ class DxgiGpuNv12Converter final {
     *out_w = even_w;
     *out_h = even_h;
 
-    context_->CopyResource(clean_bgra_.Get(), acquired_tex);
+    if (src_device == device_.Get()) {
+      context_->CopyResource(clean_bgra_.Get(), acquired_tex);
+    } else {
+      if (!CopyViaSharedBridge(src_device, src_context, acquired_tex,
+                               src_desc.Width, src_desc.Height)) {
+        return false;
+      }
+    }
     clean_bgra_valid_ = true;
     composited_has_clean_base_ = false;
     has_prev_cursor_box_ = false;
@@ -488,11 +561,97 @@ class DxgiGpuNv12Converter final {
       frame->Release();
       return false;
     }
+    context_->Flush();
     *out_frame = frame;
     return true;
   }
 
+  void ResetSharedBridge() {
+    src_bridge_mutex_.Reset();
+    src_bridge_bgra_.Reset();
+    conv_bridge_mutex_.Reset();
+    shared_bridge_bgra_.Reset();
+    src_bridge_device_ = nullptr;
+    src_bridge_w_ = 0;
+    src_bridge_h_ = 0;
+  }
+
  private:
+  bool EnsureSharedBridge(ID3D11Device* src_device, uint32_t src_w,
+                          uint32_t src_h) {
+    if (src_bridge_device_ == src_device && src_bridge_w_ == src_w &&
+        src_bridge_h_ == src_h && shared_bridge_bgra_ && src_bridge_bgra_ &&
+        conv_bridge_mutex_ && src_bridge_mutex_) {
+      return true;
+    }
+    ResetSharedBridge();
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = src_w;
+    desc.Height = src_h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = 0;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    if (FAILED(device_->CreateTexture2D(&desc, nullptr,
+                                        shared_bridge_bgra_.GetAddressOf())) ||
+        !shared_bridge_bgra_ ||
+        FAILED(shared_bridge_bgra_.As(&conv_bridge_mutex_)) ||
+        !conv_bridge_mutex_) {
+      ResetSharedBridge();
+      return false;
+    }
+    Microsoft::WRL::ComPtr<IDXGIResource> dxgi_res;
+    HANDLE shared_handle = nullptr;
+    if (FAILED(shared_bridge_bgra_.As(&dxgi_res)) || !dxgi_res ||
+        FAILED(dxgi_res->GetSharedHandle(&shared_handle)) || !shared_handle) {
+      ResetSharedBridge();
+      return false;
+    }
+    if (FAILED(src_device->OpenSharedResource(
+            shared_handle, IID_PPV_ARGS(src_bridge_bgra_.GetAddressOf()))) ||
+        !src_bridge_bgra_ ||
+        FAILED(src_bridge_bgra_.As(&src_bridge_mutex_)) ||
+        !src_bridge_mutex_) {
+      ResetSharedBridge();
+      return false;
+    }
+    src_bridge_device_ = src_device;
+    src_bridge_w_ = src_w;
+    src_bridge_h_ = src_h;
+    return true;
+  }
+
+  bool CopyViaSharedBridge(ID3D11Device* src_device,
+                           ID3D11DeviceContext* src_context,
+                           ID3D11Texture2D* acquired_tex, uint32_t src_w,
+                           uint32_t src_h) {
+    if (!EnsureSharedBridge(src_device, src_w, src_h)) {
+      return false;
+    }
+    if (FAILED(src_bridge_mutex_->AcquireSync(0, INFINITE))) {
+      ResetSharedBridge();
+      return false;
+    }
+    src_context->CopyResource(src_bridge_bgra_.Get(), acquired_tex);
+    if (FAILED(src_bridge_mutex_->ReleaseSync(1))) {
+      ResetSharedBridge();
+      return false;
+    }
+    if (FAILED(conv_bridge_mutex_->AcquireSync(1, INFINITE))) {
+      ResetSharedBridge();
+      return false;
+    }
+    context_->CopyResource(clean_bgra_.Get(), shared_bridge_bgra_.Get());
+    if (FAILED(conv_bridge_mutex_->ReleaseSync(0))) {
+      ResetSharedBridge();
+      return false;
+    }
+    return true;
+  }
+
   bool EnsurePipeline(uint32_t src_w, uint32_t src_h, uint32_t even_w,
                       uint32_t even_h) {
     uint32_t target_tex_w = 0, target_tex_h = 0;
@@ -735,6 +894,7 @@ class DxgiGpuNv12Converter final {
   }
 
   void ResetPipeline() {
+    ResetSharedBridge();
     if (pool_) {
       pool_->Retire();
       pool_.reset();
@@ -761,6 +921,13 @@ class DxgiGpuNv12Converter final {
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> vp_enum_;
   Microsoft::WRL::ComPtr<ID3D11VideoProcessor> vp_;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> clean_bgra_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> shared_bridge_bgra_;
+  Microsoft::WRL::ComPtr<IDXGIKeyedMutex> conv_bridge_mutex_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> src_bridge_bgra_;
+  Microsoft::WRL::ComPtr<IDXGIKeyedMutex> src_bridge_mutex_;
+  ID3D11Device* src_bridge_device_ = nullptr;
+  uint32_t src_bridge_w_ = 0;
+  uint32_t src_bridge_h_ = 0;
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> clean_input_view_;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> composited_bgra_;
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> composited_input_view_;
@@ -821,6 +988,8 @@ int ScreenCapturerDxgi::Destroy() {
   display_slots_.Reset();
   d3d_context_.Reset();
   d3d_device_.Reset();
+  encode_d3d_context_.Reset();
+  encode_d3d_device_.Reset();
   if (nv12_frame_) {
     delete[] nv12_frame_;
     nv12_frame_ = nullptr;
@@ -1088,74 +1257,54 @@ bool ScreenCapturerDxgi::CreateDuplicationForMonitor(int monitor_index) {
 
   duplication_.Reset();
   bool reused_device = false;
-  if (d3d_device_ && d3d_context_ &&
-      SUCCEEDED(d3d_device_->GetDeviceRemovedReason())) {
-    Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
-    Microsoft::WRL::ComPtr<IDXGIAdapter> current_adapter;
-    DXGI_ADAPTER_DESC current_desc{};
-    if (SUCCEEDED(d3d_device_.As(&dxgi_device)) && dxgi_device &&
-        SUCCEEDED(dxgi_device->GetAdapter(current_adapter.GetAddressOf())) &&
-        current_adapter && SUCCEEDED(current_adapter->GetDesc(&current_desc)) &&
-        current_desc.AdapterLuid.LowPart == adapter_desc.AdapterLuid.LowPart &&
-        current_desc.AdapterLuid.HighPart ==
-            adapter_desc.AdapterLuid.HighPart) {
-      hr = output1->DuplicateOutput(d3d_device_.Get(),
-                                    duplication_.GetAddressOf());
-      if (SUCCEEDED(hr) && duplication_) {
-        reused_device = true;
-      }
+  if (d3d_context_ && IsDeviceOnSameAdapter(d3d_device_.Get(), adapter_desc)) {
+    hr = output1->DuplicateOutput(d3d_device_.Get(),
+                                  duplication_.GetAddressOf());
+    if (SUCCEEDED(hr) && duplication_) {
+      reused_device = true;
     }
   }
 
   if (!reused_device) {
-    gpu_converter_.reset();
+    if (gpu_converter_) {
+      gpu_converter_->ResetSharedBridge();
+    }
     d3d_context_.Reset();
     d3d_device_.Reset();
 
-    UINT flags =
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-#ifdef _DEBUG
-    flags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
-    D3D_FEATURE_LEVEL feature_levels[] = {
-        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0};
-    D3D_FEATURE_LEVEL out_level{};
-    Microsoft::WRL::ComPtr<ID3D11Device> output_device;
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext> output_context;
-    hr = D3D11CreateDevice(
-        output_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-        feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
-        output_device.GetAddressOf(), &out_level,
-        output_context.GetAddressOf());
-    if (FAILED(hr)) {
-      UINT fallback_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-#ifdef _DEBUG
-      fallback_flags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
-      hr = D3D11CreateDevice(
-          output_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-          fallback_flags, feature_levels, ARRAYSIZE(feature_levels),
-          D3D11_SDK_VERSION, output_device.GetAddressOf(), &out_level,
-          output_context.GetAddressOf());
-    }
-    if (FAILED(hr)) {
-      LOG_ERROR("DXGI: create D3D device for output adapter {} failed, hr={}",
-                monitor_index, (int)hr);
+    if (!CreateD3dDeviceOnAdapter(output_adapter.Get(),
+                                  /*require_video_support=*/false,
+                                  /*multithread_protected=*/false,
+                                  &d3d_device_, &d3d_context_)) {
+      LOG_ERROR("DXGI: create D3D device for output adapter {} failed",
+                monitor_index);
       return false;
     }
-    Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
-    if (SUCCEEDED(output_device.As(&multithread)) && multithread) {
-      multithread->SetMultithreadProtected(TRUE);
-    }
-    d3d_context_ = std::move(output_context);
-    d3d_device_ = std::move(output_device);
 
     hr = output1->DuplicateOutput(d3d_device_.Get(),
                                   duplication_.GetAddressOf());
     if (FAILED(hr)) {
       LOG_ERROR("DXGI: DuplicateOutput failed, hr={}", (int)hr);
       return false;
+    }
+  }
+
+  if (!encode_d3d_context_ ||
+      !IsDeviceOnSameAdapter(encode_d3d_device_.Get(), adapter_desc)) {
+    gpu_converter_.reset();
+    encode_d3d_context_.Reset();
+    encode_d3d_device_.Reset();
+    if (!CreateD3dDeviceOnAdapter(output_adapter.Get(),
+                                  /*require_video_support=*/true,
+                                  /*multithread_protected=*/true,
+                                  &encode_d3d_device_, &encode_d3d_context_)) {
+      LOG_WARN("DXGI: dedicated encode D3D11 device failed; sharing capture device");
+      Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
+      if (SUCCEEDED(d3d_device_.As(&multithread)) && multithread) {
+        multithread->SetMultithreadProtected(TRUE);
+      }
+      encode_d3d_device_ = d3d_device_;
+      encode_d3d_context_ = d3d_context_;
     }
   }
 
@@ -1415,13 +1564,13 @@ void ScreenCapturerDxgi::CaptureLoop() {
       const bool changed = should_enumerate ? EnumerateDisplays() : false;
       if (changed || refresh || !duplication_) {
         const int target_monitor = monitor_index_.load();
-        const ID3D11Device* prev_device = d3d_device_.Get();
+        const ID3D11Device* prev_encode_device = encode_d3d_device_.Get();
         if (changed || refresh || cached_monitor != target_monitor) {
           clear_cached();
         }
         ReleaseDuplication();
         if (!CreateDuplicationForMonitor(target_monitor) ||
-            d3d_device_.Get() != prev_device) {
+            encode_d3d_device_.Get() != prev_encode_device) {
           clear_cached();
         } else if (cached_frame_valid) {
           cached_generation = duplication_generation_;
@@ -1512,14 +1661,15 @@ void ScreenCapturerDxgi::CaptureLoop() {
         return false;
       }
       const int target_monitor = monitor_index_.load();
-      const ID3D11Device* prev_device = d3d_device_.Get();
+      const ID3D11Device* prev_encode_device = encode_d3d_device_.Get();
       const DXGI_MODE_ROTATION prev_rotation = rotation_;
       if (cached_monitor != target_monitor) {
         clear_cached();
       }
       ReleaseDuplication();
       if (!CreateDuplicationForMonitor(target_monitor) ||
-          d3d_device_.Get() != prev_device || rotation_ != prev_rotation) {
+          encode_d3d_device_.Get() != prev_encode_device ||
+          rotation_ != prev_rotation) {
         clear_cached();
         if (rotation_ != prev_rotation) {
           topology_refresh_requested_.store(true);
@@ -1636,13 +1786,14 @@ void ScreenCapturerDxgi::CaptureLoop() {
     GpuNv12Frame* gpu_frame = nullptr;
     uint32_t gpu_w = 0, gpu_h = 0;
     if (rotation_ == DXGI_MODE_ROTATION_IDENTITY) {
-      if (!gpu_converter_ && d3d_device_ && d3d_context_) {
-        gpu_converter_ = std::make_unique<DxgiGpuNv12Converter>(d3d_device_,
-                                                                d3d_context_);
+      if (!gpu_converter_ && encode_d3d_device_ && encode_d3d_context_) {
+        gpu_converter_ = std::make_unique<DxgiGpuNv12Converter>(
+            encode_d3d_device_, encode_d3d_context_);
       }
-      if (gpu_converter_ &&
+      if (gpu_converter_ && d3d_device_ && d3d_context_ &&
           !gpu_converter_->CaptureAndConvert(
-              acquired_tex.Get(), frame_monitor, display_info_list_,
+              d3d_device_.Get(), d3d_context_.Get(), acquired_tex.Get(),
+              frame_monitor, display_info_list_,
               show_cursor_.load(std::memory_order_relaxed), &cursor_embedded,
               &software_cursor_drawn, &gpu_frame, &gpu_w, &gpu_h)) {
         if (gpu_frame) {
