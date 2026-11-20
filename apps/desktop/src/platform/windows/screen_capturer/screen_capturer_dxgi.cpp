@@ -837,8 +837,8 @@ class DxgiGpuNv12Converter final {
 
 class GpuDeliveryQueue final {
  public:
-  explicit GpuDeliveryQueue(cb_desktop_data callback)
-      : callback_(callback),
+  explicit GpuDeliveryQueue(ScreenCapturer::cb_desktop_data callback)
+      : callback_(std::move(callback)),
         thread_([this]() { WorkerLoop(); }) {}
 
   ~GpuDeliveryQueue() { StopAndJoin(); }
@@ -939,7 +939,7 @@ class GpuDeliveryQueue final {
     }
   }
 
-  cb_desktop_data callback_ = nullptr;
+  ScreenCapturer::cb_desktop_data callback_ = nullptr;
   std::mutex mutex_;
   std::condition_variable cv_;
   Slot pending_;
