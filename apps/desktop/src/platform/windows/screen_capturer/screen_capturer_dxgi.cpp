@@ -1455,10 +1455,12 @@ void ScreenCapturerDxgi::CaptureLoop() {
     }
   } timer_period;
   CursorFrameCompositor cursor_compositor;
-  constexpr auto kFrameDeadlineTolerance = std::chrono::microseconds(3500);
+  constexpr auto kFreshDeadlineTolerance = std::chrono::microseconds(3500);
+  constexpr auto kStaleReplayGrace = std::chrono::microseconds(3500);
   const auto frame_interval =
       std::chrono::nanoseconds(1'000'000'000) / (std::max)(1, fps_);
   auto next_frame_deadline = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point last_delivered_tp{};
   bool cached_frame_valid = false;
   bool cached_frame_fresh = false;
   bool cached_cursor_embedded = false;
@@ -1495,6 +1497,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
   };
   auto stat_window_start = std::chrono::steady_clock::now();
   uint64_t stat_acquired = 0;
+  uint64_t stat_overwritten = 0;
   uint64_t stat_cached_replays = 0;
   uint64_t stat_delivered = 0;
   uint64_t stat_access_lost = 0;
@@ -1520,22 +1523,44 @@ void ScreenCapturerDxgi::CaptureLoop() {
     }
     LOG_INFO(
         "DXGI capture stats ({:.1f}s): delivered={} fps={:.1f} acquired={} "
-        "cached={} access_lost={} conv_ms[p50={:.2f} p95={:.2f} max={:.2f}]",
+        "overwritten={} cached={} access_lost={} "
+        "conv_ms[p50={:.2f} p95={:.2f} max={:.2f}]",
         elapsed_s, stat_delivered,
         static_cast<double>(stat_delivered) / elapsed_s, stat_acquired,
-        stat_cached_replays, stat_access_lost, p50, p95, max_ms);
+        stat_overwritten, stat_cached_replays, stat_access_lost, p50, p95,
+        max_ms);
     stat_window_start = now_tp;
     stat_acquired = 0;
+    stat_overwritten = 0;
     stat_cached_replays = 0;
     stat_delivered = 0;
     stat_access_lost = 0;
     stat_conv_ms.clear();
   };
+  auto can_deliver_at = [&](std::chrono::steady_clock::time_point ref_now) {
+    return last_delivered_tp == std::chrono::steady_clock::time_point{} ||
+           ref_now + kFreshDeadlineTolerance >=
+               last_delivered_tp + frame_interval;
+  };
+  auto is_ready_to_deliver = [&](std::chrono::steady_clock::time_point ref_now) {
+    if (!cached_frame_valid || !can_deliver_at(ref_now)) return false;
+    if (cached_frame_fresh) {
+      return ref_now + kFreshDeadlineTolerance >= next_frame_deadline;
+    }
+    return ref_now >= next_frame_deadline + kStaleReplayGrace;
+  };
   auto advance_frame_deadline =
-      [&](std::chrono::steady_clock::time_point ref_now) {
-        next_frame_deadline =
-            (std::max)(next_frame_deadline + frame_interval,
-                       ref_now + frame_interval / 2);
+      [&](std::chrono::steady_clock::time_point ref_now, bool was_fresh) {
+        last_delivered_tp = ref_now;
+        if (was_fresh && ref_now >= next_frame_deadline) {
+          // Track DWM present phase when slightly past deadline so 59.94Hz
+          // drift never triggers premature stale replays before VBlank.
+          next_frame_deadline = ref_now + frame_interval;
+        } else {
+          next_frame_deadline =
+              (std::max)(next_frame_deadline + frame_interval,
+                         ref_now + frame_interval / 2);
+        }
       };
   while (running_) {
     if (paused_) {
@@ -1653,6 +1678,12 @@ void ScreenCapturerDxgi::CaptureLoop() {
                 nv12_height_, stream_id.c_str(), nullptr);
       maybe_log_capture_stats(std::chrono::steady_clock::now());
     };
+    auto deliver_if_ready = [&](std::chrono::steady_clock::time_point ref_now) {
+      if (!is_ready_to_deliver(ref_now)) return false;
+      advance_frame_deadline(ref_now, cached_frame_fresh);
+      deliver_cached();
+      return true;
+    };
     const auto try_fast_reduplicate = [&]() -> bool {
       if (HasDisplayTopologyChanged()) {
         ReleaseDuplication();
@@ -1679,31 +1710,29 @@ void ScreenCapturerDxgi::CaptureLoop() {
       if (cached_frame_valid) {
         cached_generation = duplication_generation_;
       }
-      const auto recover_now = std::chrono::steady_clock::now();
-      if (cached_frame_valid &&
-          recover_now + kFrameDeadlineTolerance >= next_frame_deadline) {
-        advance_frame_deadline(recover_now);
-        deliver_cached();
-      }
+      deliver_if_ready(std::chrono::steady_clock::now());
       return true;
     };
     const auto before_acquire = std::chrono::steady_clock::now();
-    if (cached_frame_fresh &&
-        before_acquire + kFrameDeadlineTolerance >= next_frame_deadline) {
-      advance_frame_deadline(before_acquire);
-      deliver_cached();
+    if (deliver_if_ready(before_acquire)) {
       continue;
     }
+    auto wait_target = cached_frame_fresh
+                           ? next_frame_deadline
+                           : next_frame_deadline + kStaleReplayGrace;
+    if (last_delivered_tp != std::chrono::steady_clock::time_point{}) {
+      const auto min_next =
+          last_delivered_tp + frame_interval - kFreshDeadlineTolerance;
+      if (wait_target < min_next) wait_target = min_next;
+    }
     int wait_ms = 1;
-    if (next_frame_deadline > before_acquire) {
-      const auto remaining = next_frame_deadline - before_acquire;
+    if (wait_target > before_acquire) {
+      const auto remaining_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              wait_target - before_acquire)
+              .count();
       wait_ms = static_cast<int>(
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              remaining > std::chrono::milliseconds(2)
-                  ? remaining - std::chrono::milliseconds(1)
-                  : remaining)
-              .count());
-      if (wait_ms < 1) wait_ms = 1;
+          std::clamp<int64_t>((remaining_us + 999) / 1000, 1, 50));
     }
     DXGI_OUTDUPL_FRAME_INFO frame_info{};
     Microsoft::WRL::ComPtr<IDXGIResource> desktop_resource;
@@ -1712,12 +1741,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
       // DXGI explicitly reports an unchanged desktop. Re-emit only a frame
       // successfully acquired for this monitor to keep delivering static frames.
-      const auto timeout_now = std::chrono::steady_clock::now();
-      if (timeout_now + kFrameDeadlineTolerance < next_frame_deadline) {
-        continue;
-      }
-      advance_frame_deadline(timeout_now);
-      deliver_cached();
+      deliver_if_ready(std::chrono::steady_clock::now());
       continue;
     }
     // Never replay a cached image after repeated acquisition failures or
@@ -1757,11 +1781,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
         ++stat_access_lost;
         try_fast_reduplicate();
       } else {
-        const auto after_pointer = std::chrono::steady_clock::now();
-        if (after_pointer + kFrameDeadlineTolerance >= next_frame_deadline) {
-          advance_frame_deadline(after_pointer);
-          deliver_cached();
-        }
+        deliver_if_ready(std::chrono::steady_clock::now());
       }
       continue;
     }
@@ -1858,6 +1878,9 @@ void ScreenCapturerDxgi::CaptureLoop() {
     if (converted && frame_monitor == monitor_index_.load() && callback_) {
       const auto after_convert = std::chrono::steady_clock::now();
       ++stat_acquired;
+      if (cached_frame_valid && cached_frame_fresh) {
+        ++stat_overwritten;
+      }
       stat_conv_ms.push_back(
           std::chrono::duration<double, std::milli>(after_convert - convert_start)
               .count());
@@ -1875,13 +1898,10 @@ void ScreenCapturerDxgi::CaptureLoop() {
       cached_frame_fresh = true;
 
       if (first_valid_frame) {
+        last_delivered_tp = after_convert;
         next_frame_deadline = after_convert + frame_interval;
         deliver_cached();
-      } else if (after_convert + kFrameDeadlineTolerance >=
-                 next_frame_deadline) {
-        advance_frame_deadline(after_convert);
-        deliver_cached();
-      } else {
+      } else if (!deliver_if_ready(after_convert)) {
         maybe_log_capture_stats(after_convert);
       }
     } else {
