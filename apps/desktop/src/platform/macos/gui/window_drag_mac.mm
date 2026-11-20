@@ -2,11 +2,13 @@
 
 #import <AppKit/AppKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <objc/runtime.h>
 
 #include <cmath>
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <vector>
 
 @interface CrossDeskStreamFullscreenTarget : NSObject
 - (void)toggleStreamFullscreen:(id)sender;
@@ -27,7 +29,6 @@ __weak NSWindow *gallery_window = nil;
 bool gallery_fullscreen = false;
 NSRect gallery_restore_frame = NSZeroRect;
 NSWindowStyleMask gallery_restore_style = NSWindowStyleMaskTitled;
-NSApplicationPresentationOptions gallery_restore_presentation;
 __weak NSWindow *stream_window = nil;
 __weak NSView *stream_slint_view = nil;
 CrossDeskStreamFullscreenTarget *stream_fullscreen_target = nil;
@@ -41,7 +42,8 @@ BOOL stream_restore_movable = YES;
 BOOL stream_restore_close_hidden = NO;
 BOOL stream_restore_miniaturize_hidden = NO;
 BOOL stream_restore_zoom_hidden = NO;
-NSApplicationPresentationOptions stream_restore_presentation_options =
+bool fullscreen_presentation_saved = false;
+NSApplicationPresentationOptions saved_fullscreen_presentation_options =
     NSApplicationPresentationDefault;
 
 struct FileDialogRequest {
@@ -101,6 +103,107 @@ void CenterWindowOnScreen(NSWindow *window, NSScreen *screen) {
       NSMidX(available_frame) - NSWidth(window_frame) * 0.5,
       NSMidY(available_frame) - NSHeight(window_frame) * 0.5);
   [window setFrameOrigin:centered_origin];
+}
+
+using ConstrainFrameRectImp = NSRect (*)(id, SEL, NSRect, NSScreen *);
+
+struct ConstrainHookEntry {
+  __unsafe_unretained Class window_class = Nil;
+  ConstrainFrameRectImp original_imp = nullptr;
+};
+
+std::vector<ConstrainHookEntry> &ConstrainHooks() {
+  static auto *hooks = new std::vector<ConstrainHookEntry>();
+  return *hooks;
+}
+
+bool IsCustomFullscreenWindow(id window) {
+  return (window == stream_window && stream_fullscreen) ||
+         (window == gallery_window && gallery_fullscreen);
+}
+
+NSRect CustomFullscreenConstrainFrameRect(id self, SEL cmd, NSRect frame_rect,
+                                          NSScreen *screen) {
+  if (IsCustomFullscreenWindow(self)) {
+    return frame_rect;
+  }
+  Class cls = object_getClass(self);
+  const auto &hooks = ConstrainHooks();
+  while (cls != Nil) {
+    for (const auto &entry : hooks) {
+      if (entry.window_class == cls && entry.original_imp != nullptr) {
+        return entry.original_imp(self, cmd, frame_rect, screen);
+      }
+    }
+    cls = class_getSuperclass(cls);
+  }
+  return frame_rect;
+}
+
+void EnsureUnconstrainedFullscreenHook(NSWindow *window) {
+  if (window == nil) {
+    return;
+  }
+  Class window_class = [window class];
+  auto &hooks = ConstrainHooks();
+  for (const auto &entry : hooks) {
+    if (entry.window_class == window_class) {
+      return;
+    }
+  }
+  SEL selector = @selector(constrainFrameRect:toScreen:);
+  Method method = class_getInstanceMethod(window_class, selector);
+  if (method == nullptr) {
+    return;
+  }
+  const char *encoding = method_getTypeEncoding(method);
+  ConstrainFrameRectImp original_imp = nullptr;
+  if (class_addMethod(window_class, selector,
+                      reinterpret_cast<IMP>(CustomFullscreenConstrainFrameRect),
+                      encoding)) {
+    Class super_class = class_getSuperclass(window_class);
+    Method super_method =
+        super_class != Nil ? class_getInstanceMethod(super_class, selector)
+                           : nullptr;
+    if (super_method != nullptr) {
+      original_imp = reinterpret_cast<ConstrainFrameRectImp>(
+          method_getImplementation(super_method));
+    }
+  } else {
+    original_imp = reinterpret_cast<ConstrainFrameRectImp>(
+        method_setImplementation(
+            method, reinterpret_cast<IMP>(CustomFullscreenConstrainFrameRect)));
+  }
+  hooks.push_back({window_class, original_imp});
+}
+
+NSApplicationPresentationOptions FullscreenPresentationOptions(
+    NSApplicationPresentationOptions base) {
+  // HideMenuBar must replace AutoHide* and pair with HideDock to avoid
+  // NSInvalidArgumentException and keep secondary displays' menu bars hidden.
+  return (base & ~(NSApplicationPresentationAutoHideDock |
+                   NSApplicationPresentationAutoHideMenuBar)) |
+         NSApplicationPresentationHideDock |
+         NSApplicationPresentationHideMenuBar;
+}
+
+void ApplyFullscreenPresentation(NSWindow *window) {
+  EnsureUnconstrainedFullscreenHook(window);
+  if (!fullscreen_presentation_saved) {
+    saved_fullscreen_presentation_options = NSApp.presentationOptions;
+    fullscreen_presentation_saved = true;
+  }
+  [NSApp activateIgnoringOtherApps:YES];
+  NSApp.presentationOptions =
+      FullscreenPresentationOptions(saved_fullscreen_presentation_options);
+}
+
+void RestoreFullscreenPresentationIfIdle() {
+  if (!stream_fullscreen && !gallery_fullscreen &&
+      fullscreen_presentation_saved) {
+    NSApp.presentationOptions = saved_fullscreen_presentation_options;
+    fullscreen_presentation_saved = false;
+  }
 }
 
 } // namespace
@@ -206,20 +309,19 @@ bool SetGalleryWindowFullscreen(bool fullscreen) {
       if (!screen) return false;
       gallery_restore_frame = gallery_window.frame;
       gallery_restore_style = gallery_window.styleMask;
-      gallery_restore_presentation = NSApp.presentationOptions;
       gallery_fullscreen = true;
       gallery_window.styleMask |= NSWindowStyleMaskFullSizeContentView;
       gallery_window.titleVisibility = NSWindowTitleHidden;
       gallery_window.movable = NO;
       SetTitlebarButtonsHidden(gallery_window, YES);
-      NSApp.presentationOptions |=
-          NSApplicationPresentationAutoHideDock | NSApplicationPresentationAutoHideMenuBar;
+      ApplyFullscreenPresentation(gallery_window);
       // Let the next event-loop frame paint the updated Slint layout. A
       // synchronous draw here exposes stale grid geometry during the resize.
       [gallery_window setFrame:screen.frame display:NO animate:NO];
+      [gallery_window makeKeyAndOrderFront:nil];
     } else {
       gallery_fullscreen = false;
-      NSApp.presentationOptions = gallery_restore_presentation;
+      RestoreFullscreenPresentationIfIdle();
       gallery_window.styleMask = gallery_restore_style;
       gallery_window.titleVisibility = NSWindowTitleVisible;
       gallery_window.movable = YES;
@@ -320,7 +422,7 @@ void UnregisterStreamWindow(void *opaque_slint_view) {
     stream_restore_close_hidden = NO;
     stream_restore_miniaturize_hidden = NO;
     stream_restore_zoom_hidden = NO;
-    stream_restore_presentation_options = NSApplicationPresentationDefault;
+    RestoreFullscreenPresentationIfIdle();
   }
 }
 
@@ -355,7 +457,6 @@ bool SetStreamWindowFullscreen(bool fullscreen) {
           [stream_window standardWindowButton:NSWindowMiniaturizeButton].hidden;
       stream_restore_zoom_hidden =
           [stream_window standardWindowButton:NSWindowZoomButton].hidden;
-      stream_restore_presentation_options = NSApp.presentationOptions;
 
       stream_fullscreen = true;
       stream_window.styleMask =
@@ -365,24 +466,12 @@ bool SetStreamWindowFullscreen(bool fullscreen) {
       stream_window.movable = NO;
       SetTitlebarButtonsHidden(stream_window, YES);
 
-      NSApplicationPresentationOptions presentation_options =
-          stream_restore_presentation_options;
-      if ((presentation_options & (NSApplicationPresentationHideDock |
-                                   NSApplicationPresentationAutoHideDock)) ==
-          0) {
-        presentation_options |= NSApplicationPresentationAutoHideDock;
-      }
-      if ((presentation_options & (NSApplicationPresentationHideMenuBar |
-                                   NSApplicationPresentationAutoHideMenuBar)) ==
-          0) {
-        presentation_options |= NSApplicationPresentationAutoHideMenuBar;
-      }
-      NSApp.presentationOptions = presentation_options;
+      ApplyFullscreenPresentation(stream_window);
       [stream_window setFrame:screen.frame display:YES animate:NO];
       [stream_window makeKeyAndOrderFront:nil];
     } else {
       stream_fullscreen = false;
-      NSApp.presentationOptions = stream_restore_presentation_options;
+      RestoreFullscreenPresentationIfIdle();
       stream_window.styleMask = stream_restore_style_mask;
       stream_window.titleVisibility = stream_restore_title_visibility;
       stream_window.titlebarAppearsTransparent =
