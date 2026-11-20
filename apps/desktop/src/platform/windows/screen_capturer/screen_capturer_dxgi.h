@@ -66,7 +66,8 @@ class ScreenCapturerDxgi : public ScreenCapturer {
   bool CreateDuplicationForMonitor(int monitor_index);
   void CaptureLoop();
   bool ConvertFrame(int frame_monitor, bool* cursor_embedded,
-                    CursorFrameCompositor& compositor);
+                    CursorFrameCompositor& compositor,
+                    bool* software_cursor_drawn = nullptr);
   void ReleaseDuplication();
   HRESULT ReleaseAcquiredFrame();
 

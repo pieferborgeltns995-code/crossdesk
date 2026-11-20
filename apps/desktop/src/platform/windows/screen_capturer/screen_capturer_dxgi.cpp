@@ -373,6 +373,7 @@ class DxgiGpuNv12Converter final {
   bool CaptureAndConvert(ID3D11Texture2D* acquired_tex, int frame_monitor,
                          const std::vector<DisplayInfo>& displays,
                          bool show_cursor, bool* cursor_embedded,
+                         bool* software_cursor_drawn,
                          GpuNv12Frame** out_frame, uint32_t* out_w,
                          uint32_t* out_h) {
     if (!acquired_tex || !out_frame || !out_w || !out_h) return false;
@@ -388,17 +389,19 @@ class DxgiGpuNv12Converter final {
     *out_w = even_w;
     *out_h = even_h;
     return ConvertFromClean(frame_monitor, displays, show_cursor,
-                            cursor_embedded, out_frame);
+                            cursor_embedded, software_cursor_drawn, out_frame);
   }
 
   bool ConvertFromClean(int frame_monitor,
                         const std::vector<DisplayInfo>& displays,
                         bool show_cursor, bool* cursor_embedded,
+                        bool* software_cursor_drawn,
                         GpuNv12Frame** out_frame) {
     if (!clean_bgra_ || !vp_ || !video_context_ || !pool_ || !out_frame) {
       return false;
     }
     *cursor_embedded = false;
+    if (software_cursor_drawn) *software_cursor_drawn = false;
 
     ID3D11VideoProcessorInputView* input_view = clean_input_view_.Get();
     if (frame_monitor >= 0 &&
@@ -428,6 +431,7 @@ class DxgiGpuNv12Converter final {
             }
             input_view = composited_input_view_.Get();
             *cursor_embedded = true;
+            if (software_cursor_drawn) *software_cursor_drawn = true;
           }
         }
       }
@@ -446,7 +450,6 @@ class DxgiGpuNv12Converter final {
       frame->Release();
       return false;
     }
-    context_->Flush();
     *out_frame = frame;
     return true;
   }
@@ -1052,8 +1055,10 @@ HRESULT ScreenCapturerDxgi::ReleaseAcquiredFrame() {
 }
 
 bool ScreenCapturerDxgi::ConvertFrame(int frame_monitor, bool* cursor_embedded,
-                                      CursorFrameCompositor& compositor) {
+                                      CursorFrameCompositor& compositor,
+                                      bool* software_cursor_drawn) {
   *cursor_embedded = false;
+  if (software_cursor_drawn) *software_cursor_drawn = false;
   if (!staging_) return false;
   D3D11_TEXTURE2D_DESC src_desc{};
   staging_->GetDesc(&src_desc);
@@ -1126,6 +1131,7 @@ bool ScreenCapturerDxgi::ConvertFrame(int frame_monitor, bool* cursor_embedded,
           pixels = composited;
           stride = even_width * 4;
           *cursor_embedded = true;
+          if (software_cursor_drawn) *software_cursor_drawn = true;
         }
       }
     }
@@ -1159,12 +1165,14 @@ void ScreenCapturerDxgi::CaptureLoop() {
     }
   } timer_period;
   CursorFrameCompositor cursor_compositor;
+  constexpr auto kFrameDeadlineTolerance = std::chrono::microseconds(3500);
   const auto frame_interval =
       std::chrono::nanoseconds(1'000'000'000) / (std::max)(1, fps_);
   auto next_frame_deadline = std::chrono::steady_clock::now();
   bool cached_frame_valid = false;
   bool cached_frame_fresh = false;
   bool cached_cursor_embedded = false;
+  bool cached_software_cursor_drawn = false;
   int cached_monitor = -1;
   uint64_t cached_generation = 0;
   auto next_topology_check = std::chrono::steady_clock::now();
@@ -1192,6 +1200,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
   auto clear_cached = [&] {
     cached_frame_valid = false;
     cached_frame_fresh = false;
+    cached_software_cursor_drawn = false;
     cached_gpu_frame.Reset();
   };
   auto advance_frame_deadline =
@@ -1219,7 +1228,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
     const bool refresh = topology_refresh_requested_.exchange(false) ||
                          revision != cursor_revision;
     cursor_revision = revision;
-    if (refresh || now >= next_topology_check) {
+    if (refresh || (!duplication_ && now >= next_topology_check)) {
       next_topology_check = now + std::chrono::milliseconds(500);
       const bool changed = EnumerateDisplays();
       if (changed || refresh || !duplication_) {
@@ -1254,19 +1263,19 @@ void ScreenCapturerDxgi::CaptureLoop() {
       if (!cached_frame_valid || cached_generation != duplication_generation_ ||
           cached_monitor != monitor_index_.load() || !callback_)
         return;
+      const bool show_cursor = show_cursor_.load(std::memory_order_relaxed);
       const bool need_cursor_recompose =
           !cached_frame_fresh &&
-          (show_cursor_.load(std::memory_order_relaxed) ||
-           cached_cursor_embedded);
+          (show_cursor || cached_software_cursor_drawn);
       cached_frame_fresh = false;
       if (cached_gpu_frame.frame) {
         if (need_cursor_recompose && gpu_converter_ &&
             gpu_converter_->HasCleanBgra()) {
           GpuNv12Frame* rebuilt = nullptr;
           if (gpu_converter_->ConvertFromClean(
-                  cached_monitor, display_info_list_,
-                  show_cursor_.load(std::memory_order_relaxed),
-                  &cached_cursor_embedded, &rebuilt)) {
+                  cached_monitor, display_info_list_, show_cursor,
+                  &cached_cursor_embedded, &cached_software_cursor_drawn,
+                  &rebuilt)) {
             cached_gpu_frame.Set(rebuilt, cached_gpu_frame.width,
                                  cached_gpu_frame.height);
           } else {
@@ -1292,7 +1301,8 @@ void ScreenCapturerDxgi::CaptureLoop() {
       // Recompose from the clean staging texture while showing a cursor, or
       // once after disabling it. Never replay a baked-in stale cursor.
       if (need_cursor_recompose &&
-          !ConvertFrame(cached_monitor, &cached_cursor_embedded, cursor_compositor)) {
+          !ConvertFrame(cached_monitor, &cached_cursor_embedded,
+                        cursor_compositor, &cached_software_cursor_drawn)) {
         clear_cached();
         return;
       }
@@ -1302,12 +1312,45 @@ void ScreenCapturerDxgi::CaptureLoop() {
       callback_(nv12_frame_, nv12_width_ * nv12_height_ * 3 / 2, nv12_width_,
                 nv12_height_, stream_id.c_str(), nullptr);
     };
+    const auto try_fast_reduplicate = [&]() -> bool {
+      const int target_monitor = monitor_index_.load();
+      const ID3D11Device* prev_device = d3d_device_.Get();
+      if (cached_monitor != target_monitor) {
+        clear_cached();
+      }
+      ReleaseDuplication();
+      if (!CreateDuplicationForMonitor(target_monitor) ||
+          d3d_device_.Get() != prev_device) {
+        clear_cached();
+        next_topology_check = std::chrono::steady_clock::now();
+        return false;
+      }
+      if (cached_frame_valid) {
+        cached_generation = duplication_generation_;
+      }
+      const auto recover_now = std::chrono::steady_clock::now();
+      if (cached_frame_valid &&
+          recover_now + kFrameDeadlineTolerance >= next_frame_deadline) {
+        advance_frame_deadline(recover_now);
+        deliver_cached();
+      }
+      return true;
+    };
     const auto before_acquire = std::chrono::steady_clock::now();
+    if (cached_frame_fresh &&
+        before_acquire + kFrameDeadlineTolerance >= next_frame_deadline) {
+      advance_frame_deadline(before_acquire);
+      deliver_cached();
+      continue;
+    }
     int wait_ms = 1;
     if (next_frame_deadline > before_acquire) {
+      const auto remaining = next_frame_deadline - before_acquire;
       wait_ms = static_cast<int>(
           std::chrono::duration_cast<std::chrono::milliseconds>(
-              next_frame_deadline - before_acquire)
+              remaining > std::chrono::milliseconds(2)
+                  ? remaining - std::chrono::milliseconds(1)
+                  : remaining)
               .count());
       if (wait_ms < 1) wait_ms = 1;
     }
@@ -1319,7 +1362,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
       // DXGI explicitly reports an unchanged desktop. Re-emit only a frame
       // successfully acquired for this monitor to keep delivering static frames.
       const auto timeout_now = std::chrono::steady_clock::now();
-      if (timeout_now + std::chrono::milliseconds(2) < next_frame_deadline) {
+      if (timeout_now + kFrameDeadlineTolerance < next_frame_deadline) {
         continue;
       }
       advance_frame_deadline(timeout_now);
@@ -1330,14 +1373,14 @@ void ScreenCapturerDxgi::CaptureLoop() {
     // a backend rebuild. Display recovery retains the session privacy state.
     if (FAILED(hr)) {
       LOG_ERROR("DXGI: AcquireNextFrame failed, hr={}", (int)hr);
-      ReleaseDuplication();
       // A single ACCESS_LOST (mode switch, fullscreen toggle, UAC return) is
-      // rebuilt on the next iteration. Only repeated failures fall back to
-      // the 500 ms topology cadence so a broken output does not spin while
-      // recreating D3D devices.
+      // rebuilt immediately on the same monitor without a full topology probe.
+      // Only repeated failures fall back to the 500 ms topology cadence so a
+      // broken output does not spin while recreating D3D devices.
       if (++acquire_failures == 1) {
-        next_topology_check = std::chrono::steady_clock::now();
+        try_fast_reduplicate();
       } else {
+        ReleaseDuplication();
         clear_cached();
       }
       continue;
@@ -1358,12 +1401,10 @@ void ScreenCapturerDxgi::CaptureLoop() {
     // its surface. Keep the last confirmed desktop until a present arrives.
     if (frame_info.LastPresentTime.QuadPart == 0) {
       if (FAILED(ReleaseAcquiredFrame())) {
-        ReleaseDuplication();
-        next_topology_check = std::chrono::steady_clock::now();
+        try_fast_reduplicate();
       } else {
         const auto after_pointer = std::chrono::steady_clock::now();
-        if (after_pointer + std::chrono::milliseconds(2) >=
-            next_frame_deadline) {
+        if (after_pointer + kFrameDeadlineTolerance >= next_frame_deadline) {
           advance_frame_deadline(after_pointer);
           deliver_cached();
         }
@@ -1385,6 +1426,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
     }
 
     bool cursor_embedded = false;
+    bool software_cursor_drawn = false;
     GpuNv12Frame* gpu_frame = nullptr;
     uint32_t gpu_w = 0, gpu_h = 0;
     if (rotation_ == DXGI_MODE_ROTATION_IDENTITY) {
@@ -1396,7 +1438,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
           !gpu_converter_->CaptureAndConvert(
               acquired_tex.Get(), frame_monitor, display_info_list_,
               show_cursor_.load(std::memory_order_relaxed), &cursor_embedded,
-              &gpu_frame, &gpu_w, &gpu_h)) {
+              &software_cursor_drawn, &gpu_frame, &gpu_w, &gpu_h)) {
         if (gpu_frame) {
           gpu_frame->Release();
           gpu_frame = nullptr;
@@ -1426,7 +1468,8 @@ void ScreenCapturerDxgi::CaptureLoop() {
 
       d3d_context_->CopyResource(staging_.Get(), acquired_tex.Get());
       converted =
-          ConvertFrame(frame_monitor, &cursor_embedded, cursor_compositor);
+          ConvertFrame(frame_monitor, &cursor_embedded, cursor_compositor,
+                       &software_cursor_drawn);
     }
 
     if (converted && frame_monitor == monitor_index_.load() && callback_) {
@@ -1451,8 +1494,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
         gpu_frame->Release();
         gpu_frame = nullptr;
       }
-      ReleaseDuplication();
-      next_topology_check = std::chrono::steady_clock::now();
+      try_fast_reduplicate();
       continue;
     }
 
@@ -1464,6 +1506,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
         cached_gpu_frame.Reset();
       }
       cached_cursor_embedded = cursor_embedded;
+      cached_software_cursor_drawn = software_cursor_drawn;
       cached_monitor = frame_monitor;
       cached_generation = duplication_generation_;
       cached_frame_valid = true;
@@ -1473,7 +1516,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
       if (first_valid_frame) {
         next_frame_deadline = after_convert + frame_interval;
         deliver_cached();
-      } else if (after_convert + std::chrono::milliseconds(2) >=
+      } else if (after_convert + kFrameDeadlineTolerance >=
                  next_frame_deadline) {
         advance_frame_deadline(after_convert);
         deliver_cached();
