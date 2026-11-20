@@ -28,6 +28,7 @@ namespace crossdesk {
 
 class CursorFrameCompositor;
 class DxgiGpuNv12Converter;
+class GpuDeliveryQueue;
 class GpuNv12Frame;
 
 class ScreenCapturerDxgi : public ScreenCapturer {
@@ -84,6 +85,7 @@ class ScreenCapturerDxgi : public ScreenCapturer {
   bool frame_acquired_ = false;  // Guarded by switch_mutex_ while capturing.
   Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
   std::unique_ptr<DxgiGpuNv12Converter> gpu_converter_;
+  std::unique_ptr<GpuDeliveryQueue> delivery_;
   DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
   uint64_t duplication_generation_ = 0;
   bool software_cursor_output_ = false;
