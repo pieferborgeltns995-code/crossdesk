@@ -59,8 +59,27 @@ struct ScreenSharingPower::Impl {
   HANDLE request = INVALID_HANDLE_VALUE;
   bool display = false;
   bool system = false;
+  bool throttling_disabled = false;
+
+  static bool SetEcoQosThrottlingDisabled(bool disable) {
+#ifdef PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    // StateMask=0 clears EcoQoS when ControlMask enables control; ControlMask=0 restores OS defaults.
+    state.ControlMask = disable ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
+    state.StateMask = 0;
+    return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                                 &state, sizeof(state)) != 0;
+#else
+    (void)disable;
+    return false;
+#endif
+  }
 
   void Start() {
+    throttling_disabled = SetEcoQosThrottlingDisabled(true);
+    if (!throttling_disabled)
+      LOG_DEBUG("Cannot disable process power throttling: {}", GetLastError());
     wchar_t reason_text[] = L"CrossDesk is sharing the desktop";
     REASON_CONTEXT reason{};
     reason.Version = POWER_REQUEST_CONTEXT_VERSION;
@@ -82,6 +101,10 @@ struct ScreenSharingPower::Impl {
   }
 
   void Stop() {
+    if (throttling_disabled) {
+      SetEcoQosThrottlingDisabled(false);
+      throttling_disabled = false;
+    }
     if (request == INVALID_HANDLE_VALUE) return;
     if (display) PowerClearRequest(request, PowerRequestDisplayRequired);
     if (system) PowerClearRequest(request, PowerRequestSystemRequired);
