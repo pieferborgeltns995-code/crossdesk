@@ -62,6 +62,7 @@ class ScreenCapturerDxgi : public ScreenCapturer {
   }
 
  private:
+  bool HasDisplayTopologyChanged() const;
   bool EnumerateDisplays();
   bool CreateDuplicationForMonitor(int monitor_index);
   void CaptureLoop();

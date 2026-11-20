@@ -833,6 +833,81 @@ int ScreenCapturerDxgi::ResetToInitialMonitor() {
   return SwitchTo(0);
 }
 
+bool ScreenCapturerDxgi::HasDisplayTopologyChanged() const {
+  if (display_info_list_.empty() ||
+      display_info_list_.size() != outputs_.size()) {
+    return true;
+  }
+  ScopedWindowsPhysicalCoordinates physical_coordinates;
+  struct Win32Monitor {
+    HMONITOR handle = nullptr;
+    std::string name;
+    bool is_primary = false;
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+  };
+  struct EnumContext {
+    std::vector<Win32Monitor> monitors;
+    bool failed = false;
+  } ctx;
+  const BOOL enum_ok = EnumDisplayMonitors(
+      nullptr, nullptr,
+      [](HMONITOR monitor, HDC, LPRECT, LPARAM lparam) -> BOOL {
+        auto* context = reinterpret_cast<EnumContext*>(lparam);
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(monitor, &mi)) {
+          context->failed = true;
+          return FALSE;
+        }
+        context->monitors.push_back(
+            {monitor, GetDisplayLabel(mi.szDevice),
+             (mi.dwFlags & MONITORINFOF_PRIMARY) != 0, mi.rcMonitor.left,
+             mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom});
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&ctx));
+  if (!enum_ok || ctx.failed || ctx.monitors.empty()) {
+    return true;
+  }
+
+  size_t active_slots = 0;
+  for (size_t i = 0; i < display_info_list_.size(); ++i) {
+    const auto& slot = display_info_list_[i];
+    if (!slot.handle) continue;
+    ++active_slots;
+    if (!outputs_[i]) return true;
+    const auto found = std::find_if(
+        ctx.monitors.begin(), ctx.monitors.end(),
+        [&](const Win32Monitor& item) {
+          return item.handle == static_cast<HMONITOR>(slot.handle) &&
+                 item.left == slot.left && item.top == slot.top &&
+                 item.right == slot.right && item.bottom == slot.bottom &&
+                 item.is_primary == slot.is_primary && item.name == slot.name;
+        });
+    if (found == ctx.monitors.end()) {
+      return true;
+    }
+  }
+  if (active_slots != ctx.monitors.size()) {
+    return true;
+  }
+
+  const int selected = monitor_index_.load(std::memory_order_relaxed);
+  if (selected < 0 || selected >= static_cast<int>(outputs_.size()) ||
+      !outputs_[selected]) {
+    return true;
+  }
+  DXGI_OUTPUT_DESC out_desc{};
+  if (FAILED(outputs_[selected]->GetDesc(&out_desc)) ||
+      !out_desc.AttachedToDesktop || out_desc.Rotation != rotation_) {
+    return true;
+  }
+  return false;
+}
+
 bool ScreenCapturerDxgi::EnumerateDisplays() {
   ScopedWindowsPhysicalCoordinates physical_coordinates;
   // Factories cache adapter topology. Refresh the factory as well as outputs.
@@ -1228,9 +1303,11 @@ void ScreenCapturerDxgi::CaptureLoop() {
     const bool refresh = topology_refresh_requested_.exchange(false) ||
                          revision != cursor_revision;
     cursor_revision = revision;
-    if (refresh || (!duplication_ && now >= next_topology_check)) {
+    if (refresh || now >= next_topology_check) {
       next_topology_check = now + std::chrono::milliseconds(500);
-      const bool changed = EnumerateDisplays();
+      const bool should_enumerate =
+          refresh || !duplication_ || HasDisplayTopologyChanged();
+      const bool changed = should_enumerate ? EnumerateDisplays() : false;
       if (changed || refresh || !duplication_) {
         const int target_monitor = monitor_index_.load();
         const ID3D11Device* prev_device = d3d_device_.Get();
@@ -1313,15 +1390,24 @@ void ScreenCapturerDxgi::CaptureLoop() {
                 nv12_height_, stream_id.c_str(), nullptr);
     };
     const auto try_fast_reduplicate = [&]() -> bool {
+      if (HasDisplayTopologyChanged()) {
+        ReleaseDuplication();
+        next_topology_check = std::chrono::steady_clock::now();
+        return false;
+      }
       const int target_monitor = monitor_index_.load();
       const ID3D11Device* prev_device = d3d_device_.Get();
+      const DXGI_MODE_ROTATION prev_rotation = rotation_;
       if (cached_monitor != target_monitor) {
         clear_cached();
       }
       ReleaseDuplication();
       if (!CreateDuplicationForMonitor(target_monitor) ||
-          d3d_device_.Get() != prev_device) {
+          d3d_device_.Get() != prev_device || rotation_ != prev_rotation) {
         clear_cached();
+        if (rotation_ != prev_rotation) {
+          topology_refresh_requested_.store(true);
+        }
         next_topology_check = std::chrono::steady_clock::now();
         return false;
       }
