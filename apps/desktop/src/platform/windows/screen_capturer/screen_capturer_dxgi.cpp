@@ -431,6 +431,16 @@ class DxgiGpuNv12Converter final {
 
   bool HasCleanBgra() const { return clean_bgra_ != nullptr && clean_bgra_valid_; }
 
+  void ResetSharedBridge() {
+    src_bridge_mutex_.Reset();
+    src_bridge_bgra_.Reset();
+    conv_bridge_mutex_.Reset();
+    shared_bridge_bgra_.Reset();
+    src_bridge_device_ = nullptr;
+    src_bridge_w_ = 0;
+    src_bridge_h_ = 0;
+  }
+
   bool CaptureAndConvert(ID3D11Device* src_device,
                          ID3D11DeviceContext* src_context,
                          ID3D11Texture2D* acquired_tex, int frame_monitor,
@@ -566,17 +576,6 @@ class DxgiGpuNv12Converter final {
     return true;
   }
 
-  void ResetSharedBridge() {
-    src_bridge_mutex_.Reset();
-    src_bridge_bgra_.Reset();
-    conv_bridge_mutex_.Reset();
-    shared_bridge_bgra_.Reset();
-    src_bridge_device_ = nullptr;
-    src_bridge_w_ = 0;
-    src_bridge_h_ = 0;
-  }
-
- private:
   bool EnsureSharedBridge(ID3D11Device* src_device, uint32_t src_w,
                           uint32_t src_h) {
     if (src_bridge_device_ == src_device && src_bridge_w_ == src_w &&
