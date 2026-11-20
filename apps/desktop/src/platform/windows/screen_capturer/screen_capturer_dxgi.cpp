@@ -1460,7 +1460,6 @@ void ScreenCapturerDxgi::CaptureLoop() {
   const auto frame_interval =
       std::chrono::nanoseconds(1'000'000'000) / (std::max)(1, fps_);
   auto next_frame_deadline = std::chrono::steady_clock::now();
-  std::chrono::steady_clock::time_point last_delivered_tp{};
   bool cached_frame_valid = false;
   bool cached_frame_fresh = false;
   bool cached_cursor_embedded = false;
@@ -1537,30 +1536,20 @@ void ScreenCapturerDxgi::CaptureLoop() {
     stat_access_lost = 0;
     stat_conv_ms.clear();
   };
-  auto can_deliver_at = [&](std::chrono::steady_clock::time_point ref_now) {
-    return last_delivered_tp == std::chrono::steady_clock::time_point{} ||
-           ref_now + kFreshDeadlineTolerance >=
-               last_delivered_tp + frame_interval;
-  };
   auto is_ready_to_deliver = [&](std::chrono::steady_clock::time_point ref_now) {
-    if (!cached_frame_valid || !can_deliver_at(ref_now)) return false;
+    if (!cached_frame_valid) return false;
     if (cached_frame_fresh) {
       return ref_now + kFreshDeadlineTolerance >= next_frame_deadline;
     }
     return ref_now >= next_frame_deadline + kStaleReplayGrace;
   };
   auto advance_frame_deadline =
-      [&](std::chrono::steady_clock::time_point ref_now, bool was_fresh) {
-        last_delivered_tp = ref_now;
-        if (was_fresh && ref_now >= next_frame_deadline) {
-          // Track DWM present phase when slightly past deadline so 59.94Hz
-          // drift never triggers premature stale replays before VBlank.
-          next_frame_deadline = ref_now + frame_interval;
-        } else {
-          next_frame_deadline =
-              (std::max)(next_frame_deadline + frame_interval,
-                         ref_now + frame_interval / 2);
-        }
+      [&](std::chrono::steady_clock::time_point ref_now) {
+        // Keep the periodic cadence grid instead of anchoring to ref_now on
+        // late frames, which otherwise causes cumulative sub-60fps drift.
+        next_frame_deadline =
+            (std::max)(next_frame_deadline + frame_interval,
+                       ref_now + frame_interval / 2);
       };
   while (running_) {
     if (paused_) {
@@ -1680,7 +1669,7 @@ void ScreenCapturerDxgi::CaptureLoop() {
     };
     auto deliver_if_ready = [&](std::chrono::steady_clock::time_point ref_now) {
       if (!is_ready_to_deliver(ref_now)) return false;
-      advance_frame_deadline(ref_now, cached_frame_fresh);
+      advance_frame_deadline(ref_now);
       deliver_cached();
       return true;
     };
@@ -1717,22 +1706,18 @@ void ScreenCapturerDxgi::CaptureLoop() {
     if (deliver_if_ready(before_acquire)) {
       continue;
     }
-    auto wait_target = cached_frame_fresh
-                           ? next_frame_deadline
-                           : next_frame_deadline + kStaleReplayGrace;
-    if (last_delivered_tp != std::chrono::steady_clock::time_point{}) {
-      const auto min_next =
-          last_delivered_tp + frame_interval - kFreshDeadlineTolerance;
-      if (wait_target < min_next) wait_target = min_next;
-    }
+    const auto wait_target = cached_frame_fresh
+                                 ? next_frame_deadline
+                                 : next_frame_deadline + kStaleReplayGrace;
     int wait_ms = 1;
     if (wait_target > before_acquire) {
       const auto remaining_us =
           std::chrono::duration_cast<std::chrono::microseconds>(
               wait_target - before_acquire)
               .count();
-      wait_ms = static_cast<int>(
-          std::clamp<int64_t>((remaining_us + 999) / 1000, 1, 50));
+      const int64_t rounded_ms =
+          cached_frame_fresh ? (remaining_us / 1000) : ((remaining_us + 999) / 1000);
+      wait_ms = static_cast<int>(std::clamp<int64_t>(rounded_ms, 1, 50));
     }
     DXGI_OUTDUPL_FRAME_INFO frame_info{};
     Microsoft::WRL::ComPtr<IDXGIResource> desktop_resource;
@@ -1898,7 +1883,6 @@ void ScreenCapturerDxgi::CaptureLoop() {
       cached_frame_fresh = true;
 
       if (first_valid_frame) {
-        last_delivered_tp = after_convert;
         next_frame_deadline = after_convert + frame_interval;
         deliver_cached();
       } else if (!deliver_if_ready(after_convert)) {
