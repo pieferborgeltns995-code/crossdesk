@@ -148,7 +148,7 @@ bool CreateD3dDeviceOnAdapter(
 
 class GpuNv12Pool final : public std::enable_shared_from_this<GpuNv12Pool> {
  public:
-  static constexpr size_t kMaxFrames = 6;
+  static constexpr size_t kMaxFrames = 8;
 
   GpuNv12Pool(Microsoft::WRL::ComPtr<ID3D11Device> device,
               Microsoft::WRL::ComPtr<ID3D11DeviceContext> context)
