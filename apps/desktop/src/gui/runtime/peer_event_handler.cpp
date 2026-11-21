@@ -128,7 +128,10 @@ void PeerEventHandler::OnSignalMessage(const char* message, size_t size,
       j["status"] == "failed" && j.contains("transmission_id") &&
       j["transmission_id"].is_string()) {
     const auto props = runtime->FindRemoteSession(j["transmission_id"].get<std::string>());
-    if (props && !props->closing_) props->connection_auth_.Rejected(j);
+    if (props && !props->closing_) {
+      props->join_in_flight_ = false;
+      props->connection_auth_.Rejected(j);
+    }
   } else if (type == "announcements_changed") {
     runtime->announcements_.Refresh();
   } else if (type == "announcements") {
@@ -397,6 +400,7 @@ void PeerEventHandler::DispatchConnectionStatus(MiniRtcConnectionStatus status,
           runtime->need_to_create_stream_window_ = true;
         }
         props->connection_established_ = true;
+        props->join_in_flight_ = false;
         props->was_connected_ = true;
         props->recent_connection_dirty_ = true;
         if (!props->wall_managed_) runtime->start_keyboard_capturer_ = true;
@@ -408,6 +412,7 @@ void PeerEventHandler::DispatchConnectionStatus(MiniRtcConnectionStatus status,
         runtime->keyboard_.ReleaseRemotePressedKeys(remote_id,
                                                     "connection_closed");
         props->connection_established_ = false;
+        props->join_in_flight_ = false;
         {
           std::lock_guard lock(props->remote_version_mutex_);
           props->remote_host_info_received_ = false;

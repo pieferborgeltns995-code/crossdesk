@@ -139,6 +139,8 @@ struct RemoteSession {
   // Transport callbacks publish changes; the UI thread persists history.
   std::atomic<bool> recent_connection_dirty_{false};
   bool rejoin_ = false;
+  bool join_in_flight_ = false;
+  std::chrono::steady_clock::time_point join_sent_at_{};
   bool net_traffic_stats_button_pressed_ = false;
   bool enable_mouse_control_ = true;
   bool mouse_controller_is_started_ = false;

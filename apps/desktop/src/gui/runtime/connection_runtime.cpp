@@ -705,6 +705,25 @@ int GuiRuntime::ConnectTo(const std::string& remote_id, const char* password,
                  static_cast<int>(status));
         return 0;
       }
+      const bool has_new_password =
+          password && *password &&
+          strcmp(password, stale->remote_password_) != 0;
+      if ((status == MiniRtcConnectionStatus::MiniRtcConnectionConnecting ||
+           status == MiniRtcConnectionStatus::MiniRtcConnectionGathering) &&
+          stale->join_in_flight_ && !stale->rejoin_ && !has_new_password &&
+          !stale->connection_auth_.Get().password_required &&
+          (status == MiniRtcConnectionStatus::MiniRtcConnectionGathering ||
+           std::chrono::steady_clock::now() - stale->join_sent_at_ <
+               std::chrono::seconds(5))) {
+        if (background) {
+          stale->wall_managed_ = true;
+          MuteRemoteAudio(stale);
+        } else {
+          show_connection_status_window_ = true;
+        }
+        LOG_INFO("Ignoring duplicate connect while join is already in flight");
+        return 0;
+      }
     }
   }
 
@@ -797,8 +816,11 @@ int GuiRuntime::ConnectTo(const std::string& remote_id, const char* password,
       ret = MiniRtcJoinConnection(props->peer_, remote_id_with_pwd.c_str());
       if (0 == ret) {
         props->rejoin_ = false;
+        props->join_in_flight_ = true;
+        props->join_sent_at_ = std::chrono::steady_clock::now();
       } else {
         props->rejoin_ = true;
+        props->join_in_flight_ = false;
         need_to_rejoin_ = true;
       }
     }
