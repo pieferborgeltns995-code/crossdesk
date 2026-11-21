@@ -7,6 +7,7 @@
 #ifndef _GUI_APPLICATION_H_
 #define _GUI_APPLICATION_H_
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -93,8 +94,13 @@ private:
   void SyncPlatformDialogs();
   void SyncStreamWindow();
   void SyncStreamVideoFrame();
+  void PresentPendingVideoFrame();
   void ScheduleNextVideoFrame();
+  void RequestVideoFrameWakeup() override;
   void ConfigureStreamVideoRenderer();
+#if defined(__APPLE__)
+  void ApplyMacLowLatencyDisplayMode();
+#endif
   void SyncStreamKeyboardFocus();
   void SetStreamKeyboardFocus(bool focused);
   void SyncServerWindow();
@@ -144,6 +150,8 @@ private:
       cursor_delivery_states_;
   uint32_t cursor_state_sequence_ = 0;
   SignalConnectionIndicator signal_connection_indicator_;
+  std::shared_ptr<std::atomic<bool>> video_wakeup_alive_ =
+      std::make_shared<std::atomic<bool>>(true);
 #if (defined(__linux__) && !defined(__OHOS__)) && !defined(__APPLE__)
   bool use_xwayland_gui_ = false;
   bool use_x11_custom_titlebar_ = false;

@@ -290,6 +290,11 @@ inline int ApplyStreamWindowStrings(
       Text(localization::video_priority_quality[language]));
   strings.set_priority_balanced(
       Text(localization::video_priority_balanced[language]));
+  strings.set_display_sync(Text(localization::video_display_sync[language]));
+  strings.set_display_mode_vsync(
+      Text(localization::video_display_vsync[language]));
+  strings.set_display_mode_low_latency(
+      Text(localization::video_display_low_latency[language]));
   strings.set_audio(Text(localization::audio_capture[language]));
   strings.set_mute(Text(localization::mute[language]));
   strings.set_select_file(Text(localization::select_file[language]));

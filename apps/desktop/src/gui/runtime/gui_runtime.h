@@ -293,9 +293,16 @@ class GuiRuntime : protected gui_detail::GuiState {
   SettingsManager settings_;
   RemoteResolutionStore remote_resolutions_;
   KeyboardController keyboard_;
+  void NotifyVideoFrameDirty() {
+    video_frame_dirty_.store(true, std::memory_order_release);
+    RequestVideoFrameWakeup();
+  }
+  virtual void RequestVideoFrameWakeup() {}
+
   RemoteInputDispatcher remote_input_;
   std::shared_ptr<PeerEventHandler> peer_events_;
   std::atomic<bool> video_frame_dirty_{false};
+  std::atomic<bool> video_wakeup_pending_{false};
   std::unique_ptr<VideoRenderer> video_renderer_;
 
  private:

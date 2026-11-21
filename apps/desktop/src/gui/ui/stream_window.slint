@@ -46,6 +46,9 @@ export global StreamStrings {
     in-out property <string> priority-frame-rate: "Frame rate";
     in-out property <string> priority-quality: "Quality";
     in-out property <string> priority-balanced: "Balanced";
+    in-out property <string> display-sync: "Display delay";
+    in-out property <string> display-mode-vsync: "VSync";
+    in-out property <string> display-mode-low-latency: "Low latency";
 
     in-out property <string> select-display: "Select Display";
     in-out property <string> send-shortcut: "Send Shortcut";
@@ -331,6 +334,9 @@ export component StreamWindow inherits Window {
     in-out property <int> frame-rate-index: 1;
     in-out property <int> adaptation-policy-index: 1;
     callback change-video-settings(int, int, int);
+    in-out property <bool> low-latency-display-visible: false;
+    in-out property <bool> low-latency-display-enabled: false;
+    callback toggle-low-latency-display(bool);
     in property <[string]> remote-resolutions;
     in property <bool> remote-resolution-visible: false;
     in property <int> remote-resolution-index: -1;
@@ -434,6 +440,7 @@ export component StreamWindow inherits Window {
     private property <length> video-menu-width: min(320px, video.width - 8px);
     private property <length> video-menu-height:
         (root.video-settings-enabled && root.video-settings-feedback == "" ? 182px : 220px)
+        + (root.low-latency-display-visible ? 57px : 0px)
         + (root.remote-resolution-visible ? 57px + (root.remote-resolution-feedback == "" ? 0px : 32px) : 0px);
     private property <length> video-menu-x: min(max(4px, control.x + video-button.x), video.width - root.video-menu-width - 4px);
     private property <length> video-menu-y: root.control-panel-y(root.video-menu-height);
@@ -1692,6 +1699,12 @@ export component StreamWindow inherits Window {
                         options: [StreamStrings.priority-frame-rate, StreamStrings.priority-quality, StreamStrings.priority-balanced];
                         selected: root.adaptation-policy-index; enabled: root.video-settings-enabled;
                         choose(index) => { root.change-video-settings(root.video-quality-index, root.frame-rate-index, index); }
+                    }
+                    if root.low-latency-display-visible: VideoSettingRow {
+                        label: StreamStrings.display-sync;
+                        options: [StreamStrings.display-mode-vsync, StreamStrings.display-mode-low-latency];
+                        selected: root.low-latency-display-enabled ? 1 : 0; enabled: true;
+                        choose(index) => { root.toggle-low-latency-display(index == 1); }
                     }
                     if !root.video-settings-enabled || root.video-settings-feedback != "": Text {
                         text: root.video-settings-enabled ? root.video-settings-feedback : StreamStrings.video-settings-unavailable; wrap: word-wrap;

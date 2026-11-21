@@ -504,6 +504,7 @@ struct MacMetalVideoRenderer::Impl {
       std::make_shared<std::atomic<bool>>(true);
   std::atomic<bool> native_path_logged{false};
   std::atomic<bool> native_fallback_logged{false};
+  std::atomic<bool> low_latency_mode{false};
 
   Impl() {
     @autoreleasepool {
@@ -1016,8 +1017,10 @@ bool MacMetalVideoRenderer::Attach(void* opaque_slint_view) {
     impl_->metal_layer.framebufferOnly = YES;
     impl_->metal_layer.opaque = YES;
     impl_->metal_layer.backgroundColor = NSColor.blackColor.CGColor;
-    impl_->metal_layer.maximumDrawableCount = 3;
-    impl_->metal_layer.displaySyncEnabled = YES;
+    const bool low_latency =
+        impl_->low_latency_mode.load(std::memory_order_acquire);
+    impl_->metal_layer.maximumDrawableCount = low_latency ? 2 : 3;
+    impl_->metal_layer.displaySyncEnabled = low_latency ? NO : YES;
 
     [requested_view.superview addSubview:impl_->video_view
                                positioned:NSWindowBelow
@@ -1075,6 +1078,18 @@ void MacMetalVideoRenderer::Detach() {
 
 bool MacMetalVideoRenderer::IsAttached() const {
   return impl_ && impl_->attached.load(std::memory_order_acquire);
+}
+
+void MacMetalVideoRenderer::SetLowLatencyMode(bool enabled) {
+  if (!impl_) {
+    return;
+  }
+  impl_->low_latency_mode.store(enabled, std::memory_order_release);
+  if (impl_->metal_layer != nil) {
+    impl_->metal_layer.maximumDrawableCount = enabled ? 2 : 3;
+    impl_->metal_layer.displaySyncEnabled = enabled ? NO : YES;
+    impl_->native_surface_needs_redraw->store(true, std::memory_order_release);
+  }
 }
 
 bool MacMetalVideoRenderer::NeedsSurfaceRedraw() const {

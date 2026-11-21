@@ -56,6 +56,7 @@ class ConfigCenter {
   int SetTrustedDevicesOnly(bool enabled);
   int SetSaveRemotePreviews(bool enabled);
   int SetPauseVideoWhenMinimized(bool enabled);
+  int SetLowLatencyDisplay(bool enabled);
   int SetShowControlledBar(bool enabled);
   int SetStartMinimizedToTray(bool enabled);
   int SetPortableServicePromptSuppressed(bool suppressed);
@@ -84,6 +85,7 @@ class ConfigCenter {
   bool IsTrustedDevicesOnly() const;
   bool IsSaveRemotePreviews() const;
   bool IsPauseVideoWhenMinimized() const;
+  bool IsLowLatencyDisplay() const;
   bool IsShowControlledBar() const;
   bool IsStartMinimizedToTray() const;
   bool IsPortableServicePromptSuppressed() const;
@@ -123,6 +125,7 @@ class ConfigCenter {
   std::atomic<bool> trusted_devices_only_{false};
   std::atomic<bool> save_remote_previews_{true};
   std::atomic<bool> pause_video_when_minimized_{true};
+  std::atomic<bool> low_latency_display_{false};
 #ifdef _WIN32
   std::atomic<bool> show_controlled_bar_{false};
   std::atomic<bool> start_minimized_to_tray_{true};

@@ -71,6 +71,7 @@
 #include "platform/windows/service/interactive_desktop.h"
 #include "platform/windows/service/unattended_config.h"
 #elif defined(__APPLE__)
+#include "platform/macos/gui/metal_video_renderer.h"
 #include "platform/macos/gui/tray/mac_tray.h"
 #include "platform/window_drag.h"
 #elif defined(__OHOS__)
@@ -1163,7 +1164,11 @@ struct GuiApplication::SlintUi {
 };
 
 GuiApplication::GuiApplication() = default;
-GuiApplication::~GuiApplication() = default;
+GuiApplication::~GuiApplication() {
+  if (video_wakeup_alive_) {
+    video_wakeup_alive_->store(false, std::memory_order_release);
+  }
+}
 
 int GuiApplication::Run() {
 #ifndef __OHOS__
@@ -1376,6 +1381,9 @@ void GuiApplication::InitializeModules() {
   // Renderer construction can log device, shader, or pipeline failures.
   // Initialize it after Run() has selected the application's log directory.
   video_renderer_ = CreateVideoRenderer();
+#if defined(__APPLE__)
+  ApplyMacLowLatencyDisplayMode();
+#endif
   devices_.Initialize();
   CreateConnectionPeer();
   modules_inited_ = true;
@@ -2419,6 +2427,17 @@ void GuiApplication::BindStreamCallbacks() {
       props->video_settings_pending_ = true;
       props->video_settings_failed_ = false;
       props->video_settings_request_tick_ = SDL_GetTicks();
+    }
+  });
+  stream->on_toggle_low_latency_display([this](bool enabled) {
+    if (config_center_) {
+      config_center_->SetLowLatencyDisplay(enabled);
+    }
+#if defined(__APPLE__)
+    ApplyMacLowLatencyDisplayMode();
+#endif
+    if (ui_ && ui_->stream) {
+      (*ui_->stream)->set_low_latency_display_enabled(enabled);
     }
   });
   stream->on_change_remote_resolution([this](int index) {
@@ -3935,6 +3954,12 @@ void GuiApplication::SyncStreamWindow() {
 #endif
     RegisterFontAwesome((*ui_->stream)->window());
     ConfigureStreamVideoRenderer();
+#if defined(__APPLE__)
+    (*ui_->stream)->set_low_latency_display_visible(true);
+    (*ui_->stream)
+        ->set_low_latency_display_enabled(
+            config_center_ && config_center_->IsLowLatencyDisplay());
+#endif
     // Slint globals belong to a component tree. Force the next localization
     // pass to initialize the newly-created, independent stream window tree.
     ui_->localized_language = -1;
@@ -4206,6 +4231,9 @@ void GuiApplication::SyncStreamWindow() {
   }
 #if defined(__APPLE__)
   fullscreen_button_pressed_ = IsStreamWindowFullscreen();
+  (*ui_->stream)
+      ->set_low_latency_display_enabled(
+          config_center_ && config_center_->IsLowLatencyDisplay());
 #else
   fullscreen_button_pressed_ = (*ui_->stream)->window().is_fullscreen();
 #endif
@@ -4395,7 +4423,44 @@ void GuiApplication::ConfigureStreamVideoRenderer() {
       [this] { video_frame_dirty_.store(true, std::memory_order_release); });
 }
 
-void GuiApplication::ScheduleNextVideoFrame() {
+#if defined(__APPLE__)
+void GuiApplication::ApplyMacLowLatencyDisplayMode() {
+  if (!video_renderer_) {
+    return;
+  }
+  if (auto* metal_renderer =
+          dynamic_cast<MacMetalVideoRenderer*>(video_renderer_.get())) {
+    const bool enabled =
+        config_center_ && config_center_->IsLowLatencyDisplay();
+    metal_renderer->SetLowLatencyMode(enabled);
+  }
+}
+#endif
+
+void GuiApplication::RequestVideoFrameWakeup() {
+  if (!video_wakeup_alive_ ||
+      !video_wakeup_alive_->load(std::memory_order_acquire)) {
+    return;
+  }
+  if (video_wakeup_pending_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  auto alive = video_wakeup_alive_;
+  slint::invoke_from_event_loop([this, alive]() {
+    if (!alive->load(std::memory_order_acquire)) {
+      return;
+    }
+    // Clear pending before consuming video_frame_dirty_ so a concurrent decode
+    // completion never gets coalesced away after the dirty flag is sampled.
+    video_wakeup_pending_.store(false, std::memory_order_release);
+    if (!ui_ || exit_) {
+      return;
+    }
+    PresentPendingVideoFrame();
+  });
+}
+
+void GuiApplication::PresentPendingVideoFrame() {
   if (!ui_) {
     return;
   }
@@ -4407,13 +4472,21 @@ void GuiApplication::ScheduleNextVideoFrame() {
   if (frame_dirty || native_render_needed) {
     SyncStreamVideoFrame();
   }
+}
 
-  // Avoid rounding a 16.67ms frame interval up to 17ms+, which slips past VSync
-  // and drops 60fps down to ~40fps. Poll at 4ms only while a stream is focused
-  // so incoming decoded frames present cleanly on the next VSync without churn.
-  const bool stream_active =
-      ui_->stream && !focused_remote_id_.empty() && ui_->gallery_control_id.empty();
-  const auto poll_delay = stream_active ? 4ms : 16ms;
+void GuiApplication::ScheduleNextVideoFrame() {
+  if (!ui_) {
+    return;
+  }
+
+  PresentPendingVideoFrame();
+
+  // Decoded video frames wake the Slint UI thread directly via
+  // RequestVideoFrameWakeup(), so this timer only serves as a fallback for
+  // pending native surface redraws and idle bookkeeping.
+  const bool native_redraw_pending = ui_->stream && ui_->video_presenter &&
+                                     ui_->video_presenter->NeedsRedraw();
+  const auto poll_delay = native_redraw_pending ? 4ms : 16ms;
   ui_->video_timer.start(slint::TimerMode::SingleShot, poll_delay,
                          [this] { ScheduleNextVideoFrame(); });
 }
@@ -7188,6 +7261,9 @@ void GuiApplication::SyncGallery() {
 }
 
 void GuiApplication::Cleanup() {
+  if (video_wakeup_alive_) {
+    video_wakeup_alive_->store(false, std::memory_order_release);
+  }
   BeginShutdown();
   while (!ShutdownDrained())
     std::this_thread::sleep_for(std::chrono::milliseconds(2));

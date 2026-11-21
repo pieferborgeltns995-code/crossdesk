@@ -167,6 +167,8 @@ int ConfigCenter::Load() {
       ini_->GetBoolValue(section_, "save_remote_previews", true));
   pause_video_when_minimized_.store(
       ini_->GetBoolValue(section_, "pause_video_when_minimized", true));
+  low_latency_display_.store(
+      ini_->GetBoolValue(section_, "low_latency_display", false));
 #ifdef _WIN32
   show_controlled_bar_.store(
       ini_->GetBoolValue(section_, "show_controlled_bar", false));
@@ -281,6 +283,8 @@ int ConfigCenter::Save() {
                     save_remote_previews_.load());
   ini_->SetBoolValue(section_, "pause_video_when_minimized",
                     pause_video_when_minimized_.load());
+  ini_->SetBoolValue(section_, "low_latency_display",
+                    low_latency_display_.load());
   ini_->SetBoolValue(section_, "show_controlled_bar",
                     show_controlled_bar_.load());
   ini_->SetBoolValue(section_, "start_minimized_to_tray",
@@ -591,6 +595,18 @@ int ConfigCenter::SetPauseVideoWhenMinimized(bool enabled) {
 
 bool ConfigCenter::IsPauseVideoWhenMinimized() const {
   return pause_video_when_minimized_.load();
+}
+
+int ConfigCenter::SetLowLatencyDisplay(bool enabled) {
+  if (StoreValues({{"low_latency_display", enabled ? "true" : "false"}}) != 0) {
+    return -1;
+  }
+  low_latency_display_.store(enabled);
+  return 0;
+}
+
+bool ConfigCenter::IsLowLatencyDisplay() const {
+  return low_latency_display_.load();
 }
 
 int ConfigCenter::SetShowControlledBar(bool enabled) {
