@@ -251,9 +251,18 @@ void GuiApplication::TickLocalHost() {
           if (!ok) error("Could not apply host settings while a connection is active");
         } else if (op == "connection_settings") {
           const auto turn = message.at("turn").get<int>();
-          if (peer_ && turn >= 0 && turn <= 3)
-            MiniRtcUpdateConnectionSettings(peer_, true, message.at("av1"),
-                                             static_cast<MiniRtcTurnMode>(turn));
+          if (peer_ && turn >= 0 && turn <= 3) {
+            if (message.contains("video_codec")) {
+              const auto codec = static_cast<MiniRtcVideoCodec>(
+                  message.at("video_codec").get<int>());
+              MiniRtcUpdateConnectionSettingsEx(
+                  peer_, true, codec, static_cast<MiniRtcTurnMode>(turn));
+            } else {
+              MiniRtcUpdateConnectionSettings(
+                  peer_, true, message.at("av1"),
+                  static_cast<MiniRtcTurnMode>(turn));
+            }
+          }
         } else if (op == "reconnect") {
           if (peer_ && !HasActiveSession()) MiniRtcReconnectSignal(peer_);
         } else if (op == "trust_add") {

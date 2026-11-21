@@ -311,10 +311,15 @@ int GuiRuntime::CreateConnectionPeer() {
 #else
   params_.native_video_output = false;
 #endif
-  params_.av1_encoding = config_center_->GetVideoEncodeFormat() ==
-                                 ConfigCenter::VIDEO_ENCODE_FORMAT::AV1
-                             ? true
-                             : false;
+  const auto encode_format = config_center_->GetVideoEncodeFormat();
+  params_.av1_encoding =
+      encode_format == ConfigCenter::VIDEO_ENCODE_FORMAT::AV1;
+  params_.video_codec =
+      encode_format == ConfigCenter::VIDEO_ENCODE_FORMAT::HEVC
+          ? MiniRtcVideoCodecHEVC
+          : (encode_format == ConfigCenter::VIDEO_ENCODE_FORMAT::AV1
+                 ? MiniRtcVideoCodecAV1
+                 : MiniRtcVideoCodecH264);
   params_.turn_mode = static_cast<MiniRtcTurnMode>(config_center_->GetTurnMode());
   params_.enable_srtp = config_center_->IsEnableSrtp();
   params_.video_content_type = MiniRtcVideoContentType::ScreenContent;

@@ -5131,7 +5131,7 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
   }
   language_button_value_ =
       std::clamp(main->get_language_index(), 0, localization::kSystemLanguage);
-  video_encode_format_button_value_ = std::clamp(main->get_codec_index(), 0, 1);
+  video_encode_format_button_value_ = std::clamp(main->get_codec_index(), 0, 2);
   enable_self_hosted_ = main->get_self_hosted_enabled();
 #if !defined(__OHOS__)
   enable_autostart_ = main->get_autostart_enabled();
@@ -5263,15 +5263,21 @@ void GuiApplication::ApplySettingsFromConfig(bool reconnect) {
     // configuration. Keep the application and its console running throughout.
     CloseAllRemoteSessions();
   } else {
-    const bool av1 = config_center_->GetVideoEncodeFormat() ==
-                     ConfigCenter::VIDEO_ENCODE_FORMAT::AV1;
+    const auto encode_format = config_center_->GetVideoEncodeFormat();
+    const bool av1 = encode_format == ConfigCenter::VIDEO_ENCODE_FORMAT::AV1;
+    const MiniRtcVideoCodec video_codec =
+        encode_format == ConfigCenter::VIDEO_ENCODE_FORMAT::HEVC
+            ? MiniRtcVideoCodecHEVC
+            : (av1 ? MiniRtcVideoCodecAV1 : MiniRtcVideoCodecH264);
     const auto turn = static_cast<MiniRtcTurnMode>(config_center_->GetTurnMode());
-    if (av1 != params_.av1_encoding || turn != params_.turn_mode) {
+    if (video_codec != params_.video_codec || av1 != params_.av1_encoding ||
+        turn != params_.turn_mode) {
       // Update the listening peer for incoming connections and the template
       // copied by ConnectTo for outgoing connections. Existing sessions retain
       // the codec/ICE snapshot with which they negotiated.
-      if (!peer_ || PeerUpdateConnectionSettings(peer_, true, av1, turn) == 0) {
+      if (!peer_ || PeerUpdateConnectionSettings(peer_, true, video_codec, turn) == 0) {
         params_.av1_encoding = av1;
+        params_.video_codec = video_codec;
         params_.turn_mode = turn;
       } else {
         LOG_ERROR("Failed to apply connection settings without reconnecting");

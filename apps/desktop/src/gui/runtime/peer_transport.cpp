@@ -91,9 +91,18 @@ int PeerDisconnectPeerConnection(MiniRtcPeerPtr* peer, const char* host, const c
 }
 int PeerUpdateConnectionSettings(MiniRtcPeerPtr* peer, bool hardware, bool av1,
                                   MiniRtcTurnMode turn) {
+  return PeerUpdateConnectionSettings(
+      peer, hardware,
+      av1 ? MiniRtcVideoCodecAV1 : MiniRtcVideoCodecH264, turn);
+}
+int PeerUpdateConnectionSettings(MiniRtcPeerPtr* peer, bool hardware,
+                                 MiniRtcVideoCodec video_codec,
+                                 MiniRtcTurnMode turn) {
   if (auto send = FindLocalSender(peer))
     return send({{"op", "connection_settings"},
-          {"av1", av1}, {"turn", static_cast<int>(turn)}}) ? 0 : -1;
-  return MiniRtcUpdateConnectionSettings(peer, hardware, av1, turn);
+          {"av1", video_codec == MiniRtcVideoCodecAV1},
+          {"video_codec", static_cast<int>(video_codec)},
+          {"turn", static_cast<int>(turn)}}) ? 0 : -1;
+  return MiniRtcUpdateConnectionSettingsEx(peer, hardware, video_codec, turn);
 }
 }  // namespace crossdesk

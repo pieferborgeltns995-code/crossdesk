@@ -28,7 +28,8 @@ int PeerSendSignalMessage(MiniRtcPeerPtr*, const char*, size_t);
 int PeerReconnectSignal(MiniRtcPeerPtr*);
 int PeerDisconnectPeerConnection(MiniRtcPeerPtr*, const char*, const char*);
 int PeerUpdateConnectionSettings(MiniRtcPeerPtr*, bool, bool, MiniRtcTurnMode);
-
+int PeerUpdateConnectionSettings(MiniRtcPeerPtr*, bool, MiniRtcVideoCodec,
+                                 MiniRtcTurnMode);
 }  // namespace crossdesk
 
 #endif

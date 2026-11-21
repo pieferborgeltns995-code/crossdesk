@@ -43,8 +43,15 @@ void GuiRuntime::InitializeLan() {
                   dll_log_path_.c_str());
     params.hardware_acceleration = true;
     params.native_video_output = true;
-    params.av1_encoding = config_center_->GetVideoEncodeFormat() ==
-                          ConfigCenter::VIDEO_ENCODE_FORMAT::AV1;
+    const auto encode_format = config_center_->GetVideoEncodeFormat();
+    params.av1_encoding =
+        encode_format == ConfigCenter::VIDEO_ENCODE_FORMAT::AV1;
+    params.video_codec =
+        encode_format == ConfigCenter::VIDEO_ENCODE_FORMAT::HEVC
+            ? MiniRtcVideoCodecHEVC
+            : (encode_format == ConfigCenter::VIDEO_ENCODE_FORMAT::AV1
+                   ? MiniRtcVideoCodecAV1
+                   : MiniRtcVideoCodecH264);
     params.enable_srtp = true;
     params.turn_mode = MiniRtcTurnMode::MiniRtcTurnDisabled;
     params.video_content_type = MiniRtcVideoContentType::ScreenContent;
